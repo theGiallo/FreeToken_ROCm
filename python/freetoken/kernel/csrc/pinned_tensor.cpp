@@ -1,5 +1,5 @@
 #include <cstdint>
-#include <cuda_runtime_api.h>
+#include <freetoken/device_compat.h>
 #include <torch/extension.h>
 
 namespace {

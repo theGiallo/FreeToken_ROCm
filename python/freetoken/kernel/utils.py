@@ -19,17 +19,30 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
-    """CUDA nvcc flags for a kernel build. During the multi-arch AOT cache build,
-    `TVM_FFI_CUDA_ARCH_LIST` (e.g. "8.6 8.9 9.0 10.0 12.0") makes tvm-ffi emit a SASS cubin
+    """Device-code flags for a kernel build.
+
+    CUDA: during the multi-arch AOT cache build, `TVM_FFI_CUDA_ARCH_LIST`
+    (e.g. "8.6 8.9 9.0 10.0 12.0") makes tvm-ffi emit a SASS cubin
     (`-gencode ...code=sm_XX`) for each listed arch — but NO PTX. We add the PTX of the HIGHEST
     listed arch so a GPU newer than any listed one (no matching SASS) still runs via the driver's
     PTX→SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
-    no-op and tvm-ffi targets only the local GPU."""
+    no-op and tvm-ffi targets only the local GPU.
+
+    HIP (ROCm): tvm-ffi derives `--offload-arch` from `TVM_FFI_ROCM_ARCH_LIST` itself
+    (see kernel/platform.py); nvcc-only flags (`--expt-relaxed-constexpr`, `-gencode`)
+    are dropped — clang treats relaxed constexpr as the default.
+    """
+    from freetoken.kernel.platform import is_rocm
+
+    if is_rocm():
+        return DEFAULT_HIP_CFLAGS + extra
+
     flags = DEFAULT_CUDA_CFLAGS + extra
     arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
@@ -174,6 +187,32 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
+def _backend() -> str:
+    return "hip" if _is_rocm() else "cuda"
+
+
+def _is_rocm() -> bool:
+    from freetoken.kernel.platform import is_rocm
+
+    return is_rocm()
+
+
+def _check_device_toolchain() -> None:
+    """Validate/prep the device compiler before a kernel build.
+
+    CUDA: refuse nvcc-vs-torch major mismatches (_toolchain.py).
+    ROCm: point tvm-ffi at the pip-bundled ROCm SDK (platform.py).
+    """
+    if _is_rocm():
+        from freetoken.kernel.platform import ensure_hip_build_env
+
+        ensure_hip_build_env()
+    else:
+        from freetoken.kernel._toolchain import check_nvcc_matches_torch
+
+        check_nvcc_matches_torch()
+
+
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CppArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
@@ -201,9 +240,7 @@ def load_aot(
         return prebuilt
 
     if cuda_files:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
-
-        check_nvcc_matches_torch()
+        _check_device_toolchain()
 
     from tvm_ffi.cpp import load
 
@@ -226,6 +263,7 @@ def load_aot(
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
+        backend=_backend(),
     )
 
 
@@ -247,9 +285,7 @@ def load_jit(
         return prebuilt
 
     if cuda_files or cuda_wrappers:
-        from freetoken.kernel._toolchain import check_nvcc_matches_torch
-
-        check_nvcc_matches_torch()
+        _check_device_toolchain()
 
     from tvm_ffi.cpp import load_inline
 
@@ -281,4 +317,5 @@ def load_jit(
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
+        backend=_backend(),
     )

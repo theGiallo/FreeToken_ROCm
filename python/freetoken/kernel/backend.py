@@ -11,6 +11,15 @@ import functools
 import importlib.util
 
 
+def _is_rocm() -> bool:
+    try:
+        from freetoken.kernel.platform import is_rocm
+
+        return is_rocm()
+    except Exception:
+        return False
+
+
 def _importable(name: str) -> bool:
     # find_spec normally returns None when a package is absent, but it can raise
     # (broken parent package, or a meta_path finder that blocks the name); treat
@@ -23,12 +32,15 @@ def _importable(name: str) -> bool:
 
 @functools.cache
 def is_flashinfer_installed() -> bool:
-    return _importable("flashinfer")
+    """flashinfer ships CUDA-only binaries (its ROCm build targets CDNA), so it
+    can never serve an RDNA device -- probe False there regardless of install."""
+    return not _is_rocm() and _importable("flashinfer")
 
 
 @functools.cache
 def is_sgl_kernel_installed() -> bool:
-    return _importable("sgl_kernel")
+    """Same story as flashinfer: sgl-kernel's ROCm wheels are CDNA-only."""
+    return not _is_rocm() and _importable("sgl_kernel")
 
 
 @functools.cache
@@ -38,8 +50,10 @@ def is_triton_kernels_installed() -> bool:
     Distinct from the ``triton`` runtime we always depend on: it ships with the Triton
     source tree and has no Windows wheel. It is also not one of the six ops
     ``freetoken.kernel.triton`` reimplements, so its call-site carries its own fallback.
+    Its fused router relies on NVIDIA-only Triton features (TMA, warp specialization),
+    so it is treated as absent on ROCm.
     """
-    return _importable("triton_kernels")
+    return not _is_rocm() and _importable("triton_kernels")
 
 
 @functools.cache
@@ -50,6 +64,8 @@ def driver_cuda_version() -> int | None:
     toolkit version. Resolved through the ``_pinned_tensor`` extension's link-time
     cudart, so it works wherever the extension builds (including Windows) -- no dlopen
     by soname."""
+    if _is_rocm():
+        return None
     try:
         from freetoken.kernel.pinned import _load_pinned_extension
 

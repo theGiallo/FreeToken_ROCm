@@ -1,5 +1,6 @@
 #pragma once
 
+#include <freetoken/device_compat.h>
 #include <freetoken/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -116,10 +117,16 @@ public:
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
     if (use_pdl) {
+#ifdef __HIP_PLATFORM_AMD__
+      RuntimeCheck(
+          false, "Programmatic Dependent Launch is not supported on ROCm; "
+                 "run with use_pdl=false");
+#else
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
       m_config.attrs = &m_attr_cache;
       m_config.numAttrs = 1;
+#endif
     } else {
       m_config.numAttrs = 0;
     }

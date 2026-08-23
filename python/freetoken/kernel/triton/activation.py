@@ -46,8 +46,20 @@ def _pdl_supported() -> bool:
     return is_sm90_supported()
 
 
+def _pdl_kwargs(pdl: bool) -> dict:
+    # AMD Triton builds reject `launch_pdl` outright as an unknown kwarg, even when
+    # False -- only pass it where the feature exists.
+    return {"launch_pdl": pdl} if pdl else {}
+
+
+_IS_AMD = tl.constexpr(torch.version.hip is not None)  # constexpr inside jit fns
+
+
 @triton.jit
 def _fast_tanh(x):
+    if _IS_AMD:
+        # RDNA has no PTX; libdevice tanh compiles to the GCN fast path.
+        return tl.math.tanh(x)
     # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
     return tl.inline_asm_elementwise(
         "tanh.approx.f32 $0, $1;", "=f,f", [x],
@@ -57,6 +69,8 @@ def _fast_tanh(x):
 
 @triton.jit
 def _fast_ex2(x):
+    if _IS_AMD:
+        return tl.math.exp2(x)
     # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
     return tl.inline_asm_elementwise(
         "ex2.approx.f32 $0, $1;", "=f,f", [x],
@@ -134,7 +148,7 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, **_pdl_kwargs(pdl),
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
     )
     return out

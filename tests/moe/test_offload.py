@@ -407,6 +407,13 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
 def test_adjust_config_converts_moe_cache_rate_to_cache_size():
     from types import SimpleNamespace
 
+    import pytest
+
+    from freetoken.kernel.platform import is_rocm
+
+    if is_rocm():
+        pytest.skip("selects the NVIDIA-only 'fi' attention backend explicitly")
+
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _adjust_config
@@ -443,6 +450,13 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
 
 
 def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
+    import pytest
+
+    from freetoken.kernel.platform import is_rocm
+
+    if is_rocm():
+        pytest.skip("CUDA graph capture is disabled on ROCm")
+
     import freetoken.core as core
     from freetoken.core import Context, Req, get_global_ctx
     from freetoken.engine.graph import GraphRunner

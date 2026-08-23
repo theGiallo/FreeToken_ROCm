@@ -25,7 +25,7 @@ struct StoreKernelParams {
 template <std::size_t kNumThreads, std::size_t kMaxOccupancy, bool kUsePDL,
           std::size_t kElementSize, std::integral T>
 __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
-    store_kv_cache(const __grid_constant__ StoreKernelParams params) {
+    store_kv_cache(const FT_GRID_CONSTANT StoreKernelParams params) {
   using namespace device;
 
   constexpr auto kWarpPerBlock =
@@ -72,18 +72,18 @@ struct StoreKernel {
 
     TensorMatcher({-1, D}) //
         .with_strides({X, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kFTGpuDevice>(device_)
         .with_dtype(dtype_)
         .verify(k_cache)
         .verify(v_cache);
     TensorMatcher({L, D}) //
         .with_strides({Y, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kFTGpuDevice>(device_)
         .with_dtype(dtype_)
         .verify(k)
         .verify(v);
     TensorMatcher({L}) //
-        .with_device<kDLCUDA>(device_)
+        .with_device<kFTGpuDevice>(device_)
         .with_dtype<int32_t, int64_t>(indices_dtype_)
         .verify(indices);
 
@@ -111,10 +111,10 @@ struct StoreKernel {
     static_assert(num_threads % 32 == 0);
     const auto num_blocks = div_ceil(length, kWarpPerBlock);
     const auto kernel = use_int32
-                            ? store_kv_cache<num_threads, max_concurrency,
-                                             use_pdl, element_size, int32_t>
-                            : store_kv_cache<num_threads, max_concurrency,
-                                             use_pdl, element_size, int64_t>;
+                            ? &store_kv_cache<num_threads, max_concurrency,
+                                              use_pdl, element_size, int32_t>
+                            : &store_kv_cache<num_threads, max_concurrency,
+                                              use_pdl, element_size, int64_t>;
     LaunchKernel(num_blocks, num_threads, device)
         .with_attr(use_pdl)(kernel, params);
   }

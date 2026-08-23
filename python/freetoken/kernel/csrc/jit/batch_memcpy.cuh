@@ -1,3 +1,5 @@
+#pragma once
+#include <freetoken/device_compat.h>
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -20,7 +22,10 @@ struct BatchMemcpy {
         tvm::ffi::TensorView sizes,
         int64_t stream_handle
     ) {
-#if CUDART_VERSION >= 13000
+// No HIP equivalent for the batched memcpy API; the Python layer falls back to
+// fast_index_copy_multi on ROCm (kernel.backend.driver_cuda_version returns
+// None there, failing the CUDA >= 13 probe before this module is loaded).
+#if !defined(__HIP_PLATFORM_AMD__) && CUDART_VERSION >= 13000
         using namespace host;
         auto N = SymbolicSize{"batch length"};
         auto ptr_dtype = SymbolicDType{};

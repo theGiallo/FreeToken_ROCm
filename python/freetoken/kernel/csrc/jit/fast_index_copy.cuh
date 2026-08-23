@@ -1,3 +1,5 @@
+#pragma once
+#include <freetoken/device_compat.h>
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -33,6 +35,33 @@ inline constexpr auto get_mem_package() {
     }
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// RDNA3 has no PTX cache-control hints; plain dereferences keep the streaming
+// copy correct (the polling flag below stays coherent via atomicAdd).
+__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+    return *src;
+}
+
+__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+    return *src;
+}
+
+__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+    return *src;
+}
+
+__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+    *dst = value;
+}
+
+__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+    *dst = value;
+}
+
+__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+    *dst = value;
+}
+#else
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
@@ -69,13 +98,22 @@ __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
     uint32_t tmp3 = value.w;
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
 }
+#endif // __HIP_PLATFORM_AMD__
 
 __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
     // Exponential backoff to avoid hammering a global atomic in a tight loop.
     auto* flag = reinterpret_cast<int*>(const_cast<int32_t*>(flag_ptr));
     uint32_t sleep_ns = 128;
     while (atomicAdd(flag, 0) > 0) {
-#if __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__)
+        // no __nanosleep in the HIP device API; s_sleep only takes immediates,
+        // so step through fixed stalls as the backoff grows
+        if (sleep_ns < 512) {
+            __builtin_amdgcn_s_sleep(2);
+        } else {
+            __builtin_amdgcn_s_sleep(5);
+        }
+#elif (!defined(__HIP_DEVICE_COMPILE__) && __CUDA_ARCH__ >= 700)
         __nanosleep(sleep_ns);
 #endif
         sleep_ns = sleep_ns < 2048 ? (sleep_ns << 1) : 2048;
@@ -147,7 +185,7 @@ inline bool host_ptr_identity() {
 }
 
 inline void* device_alias(void* ptr, DLDevice dev) {
-    if (dev.device_type == kDLCUDA || host_ptr_identity()) {
+    if (dev.device_type == kFTGpuDevice || host_ptr_identity()) {
         return ptr;
     }
     void* mapped = nullptr;
@@ -269,7 +307,7 @@ inline auto get_sync_flag_ptr(
     auto flag_dtype = host::SymbolicDType{};
     host::TensorMatcher({1})
         .with_dtype<int32_t>(flag_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kFTGpuDevice>(device)
         .verify(sync_flag);
     return static_cast<int32_t*>(sync_flag.data_ptr());
 }
@@ -344,17 +382,17 @@ struct FastIndexCopyKernel {
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kFTGpuDevice, kFTGpuHostDevice, kDLCPU>()
         .verify(src);
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kFTGpuDevice, kFTGpuHostDevice, kDLCPU>()
         .verify(dst);
 
         TensorMatcher({L})
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kFTGpuDevice>(device)
         .verify(src_indices)
         .verify(dst_indices);
 
@@ -363,7 +401,7 @@ struct FastIndexCopyKernel {
             const auto num_indices_tensor = num_indices.value();
             TensorMatcher({1})
                 .with_dtype<int64_t>(num_indices_dtype)
-                .with_device<kDLCUDA>(device)
+                .with_device<kFTGpuDevice>(device)
                 .verify(num_indices_tensor);
 
             num_indices_data_ptr = static_cast<const int64_t*>(num_indices_tensor.data_ptr());
@@ -485,7 +523,7 @@ struct MultiIndexCopyParams {
 
 template <typename IdType, std::size_t kNumThreads, std::size_t kBlocksPerBank>
 __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
-    const __grid_constant__ MultiIndexCopyParams p
+    const FT_GRID_CONSTANT MultiIndexCopyParams p
 ) {
     const int b = static_cast<int>(blockIdx.x / kBlocksPerBank);
     if (b >= p.num_banks) {
@@ -554,9 +592,8 @@ struct MultiIndexCopyKernel {
         };
         const auto use_int32 = indices_dtype.unwrap().bits == 32;
         const auto kernel = use_int32
-            ? fast_index_copy_multi<int32_t, kNumThreads, kBlocksPerBank>
-            : fast_index_copy_multi<int64_t, kNumThreads, kBlocksPerBank>;
-        LaunchKernel(static_cast<std::size_t>(kBlocksPerBank) * num_banks, kNumThreads,
+            ? &fast_index_copy_multi<int32_t, kNumThreads, kBlocksPerBank>
+            : &fast_index_copy_multi<int64_t, kNumThreads, kBlocksPerBank>;        LaunchKernel(static_cast<std::size_t>(kBlocksPerBank) * num_banks, kNumThreads,
                      device.unwrap())(kernel, params);
     }
 };

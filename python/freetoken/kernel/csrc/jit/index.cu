@@ -31,7 +31,7 @@ struct MaskedKernelParams {
 template <std::size_t kNumThreads, std::size_t kMaxOccupancy, bool kUsePDL,
           std::size_t kElementSize, std::size_t kNumSplits, std::integral T>
 __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
-    index_kernel(const __grid_constant__ IndexKernelParams params) {
+    index_kernel(const FT_GRID_CONSTANT IndexKernelParams params) {
   using namespace device;
   constexpr auto kSize = kElementSize;
   constexpr auto kSizePerWarp = kSize / kNumSplits;
@@ -62,7 +62,7 @@ template <std::size_t kNumThreads, std::size_t kMaxOccupancy, bool kUsePDL,
           std::size_t kElementSize, std::size_t kNumSplits, std::integral T>
 __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
     masked_index_kernel(
-        const __grid_constant__ MaskedKernelParams mask_params) {
+        const FT_GRID_CONSTANT MaskedKernelParams mask_params) {
   using namespace device;
   constexpr auto kSize = kElementSize;
   constexpr auto kSizePerWarp = kSize / kNumSplits;
@@ -114,15 +114,15 @@ struct IndexKernel {
 
     TensorMatcher({-1, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kFTGpuDevice>(device_)
         .verify(weights);
     TensorMatcher({L, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kFTGpuDevice>(device_)
         .verify(output);
     TensorMatcher({L}) //
         .with_dtype<int32_t, int64_t>(indices_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .with_device<kFTGpuDevice>(device_)
         .verify(indices);
 
     const auto device = device_.unwrap();
@@ -151,18 +151,18 @@ struct IndexKernel {
           .length = static_cast<std::size_t>(length),
       };
       const auto kernel =
-          use_int32 ? masked_index_kernel<num_threads, max_concurrency, use_pdl,
-                                          element_size, num_splits, int32_t>
-                    : masked_index_kernel<num_threads, max_concurrency, use_pdl,
-                                          element_size, num_splits, int64_t>;
+          use_int32 ? &masked_index_kernel<num_threads, max_concurrency, use_pdl,
+                                           element_size, num_splits, int32_t>
+                    : &masked_index_kernel<num_threads, max_concurrency, use_pdl,
+                                           element_size, num_splits, int64_t>;
       LaunchKernel(num_blocks, num_threads, device)
           .with_attr(use_pdl)(kernel, m_params);
     } else {
       const auto kernel =
-          use_int32 ? index_kernel<num_threads, max_concurrency, use_pdl,
-                                   element_size, num_splits, int32_t>
-                    : index_kernel<num_threads, max_concurrency, use_pdl,
-                                   element_size, num_splits, int64_t>;
+          use_int32 ? &index_kernel<num_threads, max_concurrency, use_pdl,
+                                    element_size, num_splits, int32_t>
+                    : &index_kernel<num_threads, max_concurrency, use_pdl,
+                                    element_size, num_splits, int64_t>;
       LaunchKernel(num_blocks, num_threads, device)
           .with_attr(use_pdl)(kernel, params);
     }

@@ -106,6 +106,14 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
     ) -> None:
+        from freetoken.kernel.platform import is_rocm
+
+        if is_rocm():
+            # Baseline ROCm: stream capture of the full model forward trips over
+            # driver/runtime corners on RDNA (and buys little without PDL), so
+            # route through the existing graphs-disabled path.
+            logger.info_rank0("CUDA graph capture is disabled on ROCm.")
+            cuda_graph_bs = []
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,

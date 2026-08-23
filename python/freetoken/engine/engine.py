@@ -963,6 +963,12 @@ def _ensure_expandable_segments() -> None:
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
+    from freetoken.kernel.platform import is_rocm
+
+    if is_rocm():
+        # expandable_segments is unimplemented in the HIP caching allocator; enabling it
+        # there corrupts subsequent allocations (spurious hipErrorOutOfMemory).
+        return
     try:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
@@ -1097,6 +1103,26 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    attn_quant = getattr(model_config, "attn_quant", None)
+
+    from freetoken.kernel.platform import is_rocm
+
+    if is_rocm():
+        # Baseline ROCm serves unquantized (bf16) weights only: every quantized
+        # path (nvfp4/marlin, mxfp4 triton GEMMs, fp8 blockwise) bottoms out in
+        # CUDA-specific kernels or PTX that RDNA3 cannot run.
+        unsupported = [
+            q
+            for q in (("experts", expert_quant), ("attention/dense", attn_quant))
+            if q[1] not in ("none", "", None)
+        ]
+        if unsupported:
+            details = ", ".join(f"{part} quant={fmt!r}" for part, fmt in unsupported)
+            raise ValueError(
+                f"This ROCm build supports unquantized (bf16) checkpoints only, "
+                f"but the model requests quantized weights ({details}). "
+                f"Load a bf16 checkpoint instead."  # noqa: ISC003
+            )
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
