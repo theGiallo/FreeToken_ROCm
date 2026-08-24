@@ -67,3 +67,42 @@ back off matrix-core instructions (`no matching matrix core intrinsic` during
 warmup) plus CUDA graphs disabled on ROCm. The MoE offload path itself works
 correctly; profiling where decode time actually goes (bank streaming vs attention
 kernel vs router/dispatch overhead) is the next step.
+
+---
+
+# UPDATE — CUDA graphs enabled on ROCm (same day)
+
+Root cause found by profiling (`PERF_INVESTIGATION_PLAN.md`): decode was
+**host-dispatch-bound** — ~2000 eager kernel launches + aten dispatch per token
+with the GPU mostly idle. Bandwidth was never the limiter (all-miss worst case
+needs 51 ms/token at the measured 12.8 GB/s PCIe; we measured 80 ms with a warm
+cache). Re-enabling CUDA-graph capture on ROCm (`engine/graph.py`) collapses the
+entire eager loop into one replayed graph:
+
+## Short prompt (39 in / 256 out), graphs ON, default config
+
+| Engine | Decode (steady-state) | Decode (wall avg) |
+|---|---|---|
+| FreeToken + graphs | **52–53 tok/s** | **33.4–38.2 tok/s** |
+| FreeToken (before) | 13–14 tok/s | 11.6–12.1 tok/s |
+| ollama | 49–51 tok/s | — |
+
+## Long prompt (517 in / 8192 max out), `moe_cache_size=4096`, graphs ON
+
+| Engine | Run | Output toks | Rate |
+|---|---|---|---|
+| FreeToken + graphs | 1 | 8191 (hit cap) | **33.6 tok/s wall / ~37.6 decode-only** |
+| FreeToken + graphs | 2 | 7907 (stop) | **33.2 tok/s wall / ~37.3 decode-only** |
+| ollama | best | 7583 (stop) | 44.07 tok/s |
+
+- Capture cost: 1.24 s at bs=1, ~0.4 GiB VRAM. Outputs remain greedy-deterministic.
+- Remaining gap vs ollama: **~1.16×** — while ollama holds all 23.9 GB resident
+  in VRAM and FreeToken streams experts over PCIe from system RAM (its design
+  target is models larger than VRAM).
+- New default: graphs ON on ROCm; set `FREETOKEN_ROCM_GRAPHS=0` to restore the
+  old eager behavior.
+
+Also landed: `_torch_fused_topk` fast path (renormalize=True routes via top-k on
+raw logits + k-wide softmax — mathematically identical, verified bitwise-equal
+expert ids across shapes/scales). No measurable e2e delta once graphs are on,
+but it removes ~60 eager launches/token for any eager-fallback user.

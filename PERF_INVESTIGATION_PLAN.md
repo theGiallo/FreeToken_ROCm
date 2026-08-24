@@ -113,3 +113,51 @@ Fairness note for any published comparison: ollama keeps the full 24 GB model
 resident in VRAM (it barely fits); FreeToken's design target is models larger
 than VRAM - the honest baseline set is the paper's Table 1 hardware, not a
 same-card llama.cpp fully-resident run.
+
+---
+
+# FINDINGS (2026-08-24, experiments executed)
+
+- **E0 - machine ceilings** (`ft bench bw`): CPU STREAM read 27.9 GB/s, PCIe
+  linear H2D 12.8 / D2H 13.6 GB/s (WSL paravirtualization ~halves PCIe vs native
+  3090-class 25 GB/s), random-row gather 12.1-12.6 GB/s. All-miss decode ceiling
+  653 MB/tok / 12.8 GB/s = 51 ms -> ~19.5 tok/s even with ZERO cache hits;
+  measured pre-fix was 12.4 tok/s with a warm cache. Transfer never was the
+  bottleneck. The bench also flags CPU-MoE/PCIe ratio 2.18x in favor of hybrid
+  fetch policies on this host (future lever).
+- **E1/E1c - profile attribution** (chrome-trace stack analysis, decode window):
+  - ~2000 kernel launches/token (1599 hipLaunchKernel + 372 module launches),
+    ~192 aten::copy_/token, GPU idle between micro-kernels: total HOST time
+    ~81 ms/token ~= whole step wall. Decode is **host-dispatch-bound**.
+  - Real math is small: ggml vec kernels + rocBLAS + GDN core ~25 ms traced
+    (itself inflated); GDN update kernel alone 0.4 ms/token. Attention/GDN NOT
+    the problem (the split-K MFMA compile failure at attention.py:240/252 falls
+    back to a path that is cheap enough at bs=1; still worth fixing someday).
+  - `hipPointerGetAttribute` x1800/tok: every Triton launch queries every pointer
+    arg (amd/driver.c extractPointer). Patched locally to probe UVA identity once
+    then skip (venv site-packages, not committed); measured e2e effect: none -
+    the queries were cheap, the tracer overstated them.
+  - Mid-step sync barriers exist but are PREFILL-only (40x `_invalidate_prefill_buffer`
+    boolean-mask indexing = hidden nonzero D2H per prefill) plus ~2 scalar H2D +
+    1 event sync per decode step. Decode loop itself is sync-clean.
+  - `_torch_fused_topk` ran ~120 tiny eager ops/token (full-vocab fp32 copy +
+    softmax + topk + renorm glue). Fast path added (see below).
+- **E2 - triton_kernels**: installable on Linux but deliberately gated off on
+  ROCm (kernel/backend.py:56 - its fused router needs NVIDIA TMA/warp-spec).
+  Dead end by design; the torch fallback is the intended ROCm router.
+- **E4 - CUDA graphs on RDNA**: with the blanket `is_rocm()` early-out removed,
+  stream capture **succeeds cleanly** on RX 7900 XTX / WSL2 / ROCm 7.1 at bs=1
+  (1.24 s, 0.4 GiB). No corner tripped for this model/backend (triton attention,
+  offload MoE). Decode went **12-14 -> 52-53 tok/s telemetry steady-state**
+  (33-38 tok/s wall incl. overheads); long-context sustained ~37.5 tok/s
+  decode-only over 8k tokens. Graphs are now default-ON on ROCm
+  (`FREETOKEN_ROCM_GRAPHS=0` restores old behavior).
+- Remaining gap after fix: ~1.16x vs ollama (44 tok/s) which runs fully
+  VRAM-resident. Next levers, in order of expected value:
+  1. Hybrid MoE backend (q* policy): B_H/B_P = 27.9/12.8 favors fetching only a
+     bandwidth-matched fraction of misses and computing overflow on CPU
+     (ensure_experts_hybrid exists; q4_0 CPU weight path availability TBD).
+  2. Prefill sync removal: device-side rewrite of `_invalidate_prefill_buffer`;
+     the 40x nonzero stalls also gate prefill overlap quality.
+  3. Attention split-K MFMA shapes on gfx1100 (compile failure -> fallback).
+  4. Larger captured graph sizes for multi-request serving (only bs=1 captured here).

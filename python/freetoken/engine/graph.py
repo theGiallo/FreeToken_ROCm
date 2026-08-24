@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -108,11 +109,23 @@ class GraphRunner:
     ) -> None:
         from freetoken.kernel.platform import is_rocm
 
-        if is_rocm():
-            # Baseline ROCm: stream capture of the full model forward trips over
-            # driver/runtime corners on RDNA (and buys little without PDL), so
-            # route through the existing graphs-disabled path.
-            logger.info_rank0("CUDA graph capture is disabled on ROCm.")
+        _rocm_graphs_off = os.getenv("FREETOKEN_ROCM_GRAPHS", "").strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if is_rocm() and _rocm_graphs_off:
+            # Historically disabled wholesale ("stream capture trips over driver/runtime
+            # corners on RDNA"). Measured on RX 7900 XTX / WSL2 / ROCm 7.1 (gfx1100,
+            # qwen35moe GGUF offload): capture succeeds cleanly at bs=1 and decode goes
+            # from ~12-14 tok/s (host-dispatch-bound eager loop) to ~33-38 tok/s wall /
+            # ~52 tok/s telemetry steady-state -- so graphs are ON by default now.
+            # Set FREETOKEN_ROCM_GRAPHS=0 to restore the old behavior if some other
+            # model/backend trips a capture corner.
+            logger.info_rank0(
+                "CUDA graph capture is disabled (FREETOKEN_ROCM_GRAPHS=0) on ROCm."
+            )
             cuda_graph_bs = []
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,

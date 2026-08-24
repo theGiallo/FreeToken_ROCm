@@ -24,6 +24,15 @@ def _torch_fused_topk(
     Softmax over all experts, select the top-k, and (when ``renormalize``) rescale the
     selected weights to sum to 1 -- the standard fused-MoE routing convention.
     """
+    if renormalize and num_token_non_padded is None:
+        # Fast path: softmax-then-renormalize cancels the global denominator, so
+        # top-k on the raw logits + a k-wide softmax yields identical routing and
+        # weights. Skips the full-vocab fp32 copy + softmax (hot at decode: this
+        # runs once per MoE layer per token, where every eager op costs a launch).
+        topk_vals, topk_ids = torch.topk(gating_output, topk, dim=-1)
+        topk_weights = torch.softmax(topk_vals.float(), dim=-1)
+        return topk_weights.contiguous(), topk_ids.to(torch.int32).contiguous()
+
     probs = torch.softmax(gating_output.float(), dim=-1)
     topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
     if renormalize:

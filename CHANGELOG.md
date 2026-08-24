@@ -41,6 +41,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ggml's `dequantize_row_q4_K`, pinned against a scalar loop port in tests).
 - The ROCm quantized-checkpoint guard now admits `expert_quant="q4_0"` (native
   GGUF K-quants run on the HIP-ported kernels; NVFP4/MXFP4/fp8 remain rejected).
+- **CUDA graphs are now enabled by default on ROCm.** Profiling showed eager decode
+  was host-dispatch-bound (~2000 launches + ~192 small copies per token, GPU mostly
+  idle); stream capture works cleanly on RX 7900 XTX / WSL2 / ROCm 7.1 at bs=1 and
+  lifted Qwen3.6-35B-A3B offload decode from ~12-14 tok/s to 52-53 tok/s telemetry
+  steady-state (~37.5 tok/s sustained over an 8k-token generation). Set
+  `FREETOKEN_ROCM_GRAPHS=0` to restore the previous eager behavior.
+- `_torch_fused_topk` fast path for `renormalize=True`: top-k on raw logits plus a
+  k-wide softmax (softmax-then-renormalize cancels the global denominator), removing
+  the full-vocab fp32 copy + softmax — ~60 fewer eager launches per token on the
+  fallback router (Windows/ROCm). Expert ids verified bitwise-equal to the old path.
 
 ### Verified
 
@@ -49,12 +59,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reconciliation against a meta-device build; adapter tests green.
 - Qwen3.6-35B-A3B GGUF (23.9 GB, from the `qwen3.6:35b-a3b_128k` Ollama blob):
   all 613 offload-layout keys reconcile shape+dtype against a meta-device build;
-  end-to-end greedy generation on GPU at ~14 tok/s steady-state decode (~11.4 tok/s
-  wall average incl. warmup) with `--moe-backend offload --moe-cache-auto`,
-  byte-identical across repeat runs. Same prompt/settings on ollama 0.32.14
-  (embedded llama.cpp): ~51 tok/s decode / ~517 tok/s prefill — the gap is the
-  known RDNA3 Triton matrix-core fallback plus CUDA-graph absence, not the MoE
-  path (see Known limitations).
+  end-to-end greedy generation byte-identical across repeat runs, with and without
+  CUDA graphs. With graphs (now default): short-prompt decode 33-38 tok/s wall /
+  52-53 tok/s steady-state; long-context (517-token prompt, 8k max output)
+  ~33.5 tok/s wall / ~37.5 tok/s decode-only, flat across context. Same
+  prompt/settings on ollama 0.32.14 (embedded llama.cpp, model fully VRAM-resident):
+  ~44-51 tok/s decode — remaining gap ~1.16x at long context. Full numbers and the
+  profiling trail: `BENCHMARK_RESULTS.md`, `PERF_INVESTIGATION_PLAN.md`.
 
 ### Known limitations
 
@@ -62,8 +73,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on 24 GB cards (GDN hybrid-radix slots ≈ 154 MB/slot); use
   `--max-running-requests 1` for this model.
 - On RDNA3 the Triton attention/GDN kernels fall back off matrix-core instructions
-  (`no matching matrix core intrinsic` warnings during warmup), making prefill and
-  decode markedly slower than hand-tuned HIP stacks such as llama.cpp. CUDA graphs
-  remain disabled on ROCm.
+  (`no matching matrix core intrinsic` warnings during warmup) — measured impact at
+  bs=1 is small (the GDN update kernel is 0.4 ms/token), but prefill kernels and
+  multi-request decode likely still pay for it. The split-K flash-decode kernel's
+  MFMA shape selection fails to compile on gfx1100 and serves via a slower fallback.
+- CUDA-graph capture on ROCm is validated for the qwen3.5/qwen35moe GGUF paths with
+  the triton attention backend; other model/backend combinations may still trip
+  capture corners — use `FREETOKEN_ROCM_GRAPHS=0` if so.
 - The MoE GGUF path requires `--moe-backend offload` (engine assertion); resident
   MoE layers only support bf16/fp8_block formats.
