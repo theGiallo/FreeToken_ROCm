@@ -77,11 +77,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Default `max_running_req=4` exceeds the KV/state budget next to ~16 GB of weights
   on 24 GB cards (GDN hybrid-radix slots ≈ 154 MB/slot); use
   `--max-running-requests 1` for this model.
-- On RDNA3 the Triton attention/GDN kernels fall back off matrix-core instructions
-  (`no matching matrix core intrinsic` warnings during warmup) — measured impact at
-  bs=1 is small (the GDN update kernel is 0.4 ms/token), but prefill kernels and
-  multi-request decode likely still pay for it. The split-K flash-decode kernel's
-  MFMA shape selection fails to compile on gfx1100 and serves via a slower fallback.
+- On RDNA3 the Triton attention/GDN kernels previously fell back off matrix-core
+  instructions (`no matching matrix core intrinsic` during warmup): the split-K
+  flash-decode kernel built an M=8 head tile for GQA group 8 (Qwen3.6: 16 q / 2 kv
+  heads), below the WMMA minimum M=16. The decode tile is now padded to M=16 with
+  dead lanes masked end-to-end — kernels compile onto WMMA, warnings are gone, and
+  all 95 triton-attention/backend tests pass. Measured bs=1 decode is unchanged
+  (attention was already cheap on the fallback), but prefill and multi-request
+  serving should benefit.
 - CUDA-graph capture on ROCm is validated for the qwen3.5/qwen35moe GGUF paths with
   the triton attention backend; other model/backend combinations may still trip
   capture corners — use `FREETOKEN_ROCM_GRAPHS=0` if so.

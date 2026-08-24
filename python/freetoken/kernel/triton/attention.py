@@ -395,7 +395,12 @@ def decode_paged_attention(
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
     valid_block_h = min(16, group)
-    block_h = triton.next_power_of_2(valid_block_h)
+    # Pad the head-axis tile to >= 16 so tl.dot maps onto RDNA3 matrix-core (WMMA)
+    # instructions, which require M >= 16 -- otherwise the compiler falls back to
+    # scalar FMA ("no matching matrix core intrinsic"). Lanes beyond VALID_BLOCK_H
+    # are fully masked (loads other=0, scores -inf, stores masked), so padding only
+    # changes which lanes the dot runs on, never the result.
+    block_h = max(16, triton.next_power_of_2(valid_block_h))
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
 
