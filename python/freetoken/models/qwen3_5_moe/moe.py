@@ -68,8 +68,21 @@ class Qwen3_5MoE(BaseOP):
         weight_format = (
             "fp8_block" if getattr(config, "expert_quant", "none") == "fp8_block" else "bf16"
         )
+        # Native-GGUF checkpoints keep their routed experts packed (offload "q4_0"
+        # banks): carry the per-bank ggml types so the MoE GEMM dispatch picks the
+        # right dequant-in-kernel branch.
+        gguf_types = getattr(config, "expert_gguf_types", None)
+        extra_attrs = (
+            {"gguf_gate_up_type": gguf_types[0], "gguf_down_type": gguf_types[1]}
+            if gguf_types is not None
+            else None
+        )
         self.experts = make_moe_layer(
-            config, layer_id=layer_id, renormalize=True, weight_format=weight_format
+            config,
+            layer_id=layer_id,
+            renormalize=True,
+            weight_format=weight_format,
+            extra_attrs=extra_attrs,
         )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.shared_expert = _SharedExpert(

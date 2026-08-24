@@ -1,9 +1,15 @@
 from .config import parse_config
 from .gguf import (
     convert_qwen35_to_gguf,
+    convert_qwen35moe_to_gguf,
+    dummy_q4_0_expert_sources,
     is_qwen35_gguf_model,
+    is_qwen35moe_gguf_model,
     iter_qwen35_gguf_weights,
+    iter_qwen35moe_gguf_weights,
+    load_q4_0_expert_sources,
     parse_qwen35_gguf_config,
+    parse_qwen35moe_gguf_config,
 )
 from .model import Qwen3_5MoEForCausalLM
 from .weight import (
@@ -21,6 +27,12 @@ __all__ = [
     "iter_qwen35_gguf_weights",
     "convert_qwen35_to_gguf",
     "is_qwen35_gguf_model",
+    "parse_qwen35moe_gguf_config",
+    "iter_qwen35moe_gguf_weights",
+    "convert_qwen35moe_to_gguf",
+    "is_qwen35moe_gguf_model",
+    "load_q4_0_expert_sources",
+    "dummy_q4_0_expert_sources",
     "iter_weights",
     "iter_weights_parallel",
     "load_nvfp4_expert_sources",

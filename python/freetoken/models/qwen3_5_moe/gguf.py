@@ -42,7 +42,7 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
 )
-from freetoken.models.gguf.dequant import GGML_F32, GGML_Q8_0, dequantize, row_bytes
+from freetoken.models.gguf.dequant import GGML_F32, GGML_Q4_0, GGML_Q8_0, dequantize, row_bytes
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -179,7 +179,7 @@ def _channel_gather_index(head_index: torch.Tensor, head_dim: int) -> torch.Tens
 
 
 def _to_bf16(t) -> torch.Tensor:
-    """Dequantize a GgufTensor (F32 here) to a dense bf16 tensor of its torch shape."""
+    """Dequantize a GgufTensor to a dense bf16 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
     return flat.reshape(t.shape)
 
@@ -415,20 +415,11 @@ class GGUFLMHead(BaseOP):
         return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
 
 
-def convert_qwen35_to_gguf(model, config: ModelConfig) -> None:
-    """In place: replace the dense projections + embedding + lm_head with native GGUF ops.
-
-    Swapped (packed, dequantized only inside the ggml kernels): attention qkv/o, MLP
-    gate/up/down, GDN in_proj parts and out_proj, the token embedding (Q4_K here) and
-    the untied lm_head (Q6_K). Left dense: every norm plus the small fp32 GDN params.
-    Part layouts must match :func:`iter_qwen35_gguf_weights`.
-    """
+def _convert_attention_stack(model, config: ModelConfig, types: dict[str, int]) -> None:
+    """Swap the token embedding, LM head and every layer's attention / GDN projections
+    for native-GGUF ops. Shared by the dense and MoE converts; MoE-specific MLP swaps
+    live in the callers. ``model`` is the ``BaseLLMModel`` (owns ``lm_head``)."""
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-
-    path = config.gguf_source_path
-    assert path is not None, "GGUF model config lacks gguf_source_path"
-    types = {t.name: t.ggml_type for t in iter_gguf_tensors(path)}
 
     g = config.linear_attention_group()
     assert g is not None
@@ -436,7 +427,6 @@ def convert_qwen35_to_gguf(model, config: ModelConfig) -> None:
     v_dim = g.num_value_heads * g.value_head_dim
     nv = g.num_value_heads
     hidden = config.hidden_size
-    inter = config.intermediate_size
     q_gate = config.num_qo_heads * config.head_dim * 2
     kv = config.num_kv_heads * config.head_dim
 
@@ -463,7 +453,7 @@ def convert_qwen35_to_gguf(model, config: ModelConfig) -> None:
                     (nv, None),
                 ],
             )
-            # out_proj arrives as Q5_K with its permutation running across packed
+            # out_proj arrives as a K-quant with its permutation running across packed
             # superblocks -> requantized to Q8_0 by the iterator.
             attn.out_proj = GGUFLinear(v_dim, hidden, GGML_Q8_0)
         else:
@@ -477,15 +467,440 @@ def convert_qwen35_to_gguf(model, config: ModelConfig) -> None:
                 ],
             )
             attn.o_proj = GGUFLinear(q_gate // 2, hidden, types[f"blk.{lid}.attn_output.weight"])
+
+
+def _gguf_types(model_path: str) -> dict[str, int]:
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    return {t.name: t.ggml_type for t in iter_gguf_tensors(model_path)}
+
+
+def convert_qwen35_to_gguf(model, config: ModelConfig) -> None:
+    """In place: replace the dense projections + embedding + lm_head with native GGUF ops.
+
+    Swapped (packed, dequantized only inside the ggml kernels): attention qkv/o, MLP
+    gate/up/down, GDN in_proj parts and out_proj, the token embedding (Q4_K here) and
+    the untied lm_head (Q6_K). Left dense: every norm plus the small fp32 GDN params.
+    Part layouts must match :func:`iter_qwen35_gguf_weights`.
+    """
+    from freetoken.layers.gguf import GGUFLinear
+
+    path = config.gguf_source_path
+    assert path is not None, "GGUF model config lacks gguf_source_path"
+    types = _gguf_types(path)
+    inter = config.intermediate_size
+
+    _convert_attention_stack(model, config, types)
+
+    for layer in model.model.layers.op_list:
+        lid = layer._layer_id
         mlp = layer.mlp
         mlp.gate_up_proj = GGUFMergedLinear(
-            hidden,
+            config.hidden_size,
             [
                 (inter, types[f"blk.{lid}.ffn_gate.weight"]),
                 (inter, types[f"blk.{lid}.ffn_up.weight"]),
             ],
         )
-        mlp.down_proj = GGUFLinear(inter, hidden, types[f"blk.{lid}.ffn_down.weight"])
+        mlp.down_proj = GGUFLinear(inter, config.hidden_size, types[f"blk.{lid}.ffn_down.weight"])
+
+
+# --------------------------------------------------------------------------------------
+# Qwen3.6 / Qwen3.5 MoE ("qwen35moe") GGUF adapter
+# --------------------------------------------------------------------------------------
+
+
+def parse_qwen35moe_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
+    """``ModelConfig`` for a qwen35moe GGUF checkpoint (e.g. Qwen3.6-35B-A3B).
+
+    Same hybrid geometry as the dense parse; every decoder layer is a routed-MoE layer
+    (``feed_forward_length == 0``, no dense FFN tensors) plus a gated shared expert.
+    The routed experts stay native-packed: ``expert_quant="q4_0"`` selects the offload
+    bank format and :data:`expert_gguf_types` carries the actual per-bank ggml types
+    (Q4_K gate/up, Q6_K down on current checkpoints). The vision tower metadata is
+    ignored (text-only serving).
+    """
+    m = shim.metadata
+
+    def g(key):
+        val = m.get(f"qwen35moe.{key}")
+        if val is None:
+            raise KeyError(f"missing GGUF metadata key qwen35moe.{key}")
+        return val
+
+    def gopt(key, default):
+        return m.get(f"qwen35moe.{key}", default)
+
+    def gnum(key):
+        """Scalar or per-layer GGUF array (MoE checkpoints write ``attention.head_count_kv``
+        as one entry per block: 0 on the GDN layers, the real count on full-attention
+        layers -- read the geometry off a full layer)."""
+        val = g(key)
+        if isinstance(val, (list, tuple)):
+            idx = ((num_layers // interval) * interval) - 1
+            assert len(val) == num_layers and idx >= 0, (
+                f"{key}: array of {len(val)} vs {num_layers} blocks"
+            )
+            return int(val[idx])
+        return int(val)
+
+    block_count = int(g("block_count"))
+    num_layers = block_count - int(gopt("nextn_predict_layers", 0))
+    assert num_layers > 0, f"empty base stack (block_count={block_count})"
+    interval = int(gopt("full_attention_interval", 4))
+    full_layer_ids = tuple(i for i in range(num_layers) if (i + 1) % interval == 0)
+    linear_layer_ids = tuple(i for i in range(num_layers) if (i + 1) % interval != 0)
+    assert full_layer_ids, "no full-attention layers"
+
+    hidden = int(g("embedding_length"))
+    full_head_dim = int(g("attention.key_length"))
+    assert int(g("attention.value_length")) == full_head_dim, "asymmetric full-attn head dims"
+
+    rotary = RotaryConfig(
+        head_dim=full_head_dim,
+        rotary_dim=int(g("rope.dimension_count")),
+        max_position=int(g("context_length")),
+        base=float(g("rope.freq_base")),
+        scaling=None,
+    )
+    full_group = FullAttentionGroupConfig(
+        name="full",
+        layer_ids=full_layer_ids,
+        num_kv_heads=gnum("attention.head_count_kv"),
+        head_dim=full_head_dim,
+        rotary_config=rotary,
+    )
+    num_key_heads = int(g("ssm.group_count"))
+    num_value_heads = int(g("ssm.time_step_rank"))
+    value_head_dim = int(g("ssm.inner_size")) // num_value_heads
+    assert num_value_heads * value_head_dim == int(g("ssm.inner_size")), "bad ssm.inner_size"
+    key_head_dim = int(g("ssm.state_size"))
+    linear_group = LinearGatedDeltaGroupConfig(
+        name="linear",
+        layer_ids=linear_layer_ids,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_head_dim,
+        value_head_dim=value_head_dim,
+        conv_kernel_dim=int(g("ssm.conv_kernel")),
+        output_gate=True,
+    )
+    groups = tuple(sorted((full_group, linear_group), key=lambda grp: grp.layer_ids[0]))
+
+    moe_inter = int(g("expert_feed_forward_length"))
+    return ModelConfig(
+        num_layers=num_layers,
+        num_qo_heads=int(g("attention.head_count")),
+        num_kv_heads=gnum("attention.head_count_kv"),
+        head_dim=full_head_dim,
+        hidden_size=hidden,
+        vocab_size=int(shim.vocab_size),
+        # No dense MLP exists (feed_forward_length == 0); keep the field sane regardless.
+        intermediate_size=max(int(gopt("feed_forward_length", 0)), moe_inter),
+        hidden_act="silu",
+        rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
+        tie_word_embeddings=bool(shim.tie_word_embeddings),
+        rotary_config=rotary,
+        num_experts=int(g("expert_count")),
+        num_experts_per_tok=int(g("expert_used_count")),
+        moe_intermediate_size=moe_inter,
+        shared_expert_intermediate_size=int(
+            gopt("expert_shared_feed_forward_length", moe_inter)
+        ),
+        norm_topk_prob=True,
+        moe_enabled=True,
+        expert_quant="q4_0",
+        moe_weight_format="q4_0",
+        expert_gguf_types=_moe_gguf_types(shim.model_path),
+        use_qk_norm=True,
+        model_type=str(shim.model_type),
+        architectures=list(shim.architectures),
+        vision_config=None,
+        attention_groups=groups,
+        gguf_source_path=shim.model_path,
+    )
+
+
+def _moe_gguf_types(model_path: str) -> tuple[int, int]:
+    """(gate_up, down) ggml types of the routed experts, from the first block's tensors."""
+    types = _gguf_types(model_path)
+    gu = types["blk.0.ffn_gate_exps.weight"]
+    dn = types["blk.0.ffn_down_exps.weight"]
+    return (int(gu), int(dn))
+
+
+def iter_qwen35moe_gguf_weights(
+    model_path: str,
+    device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield (param_name, tensor) for every ``Qwen3_5MoEForCausalLM`` param.
+
+    Attention / GDN handling is identical to :func:`iter_qwen35_gguf_weights` (same V-head
+    tile reorder, same ``ssm_out`` dequant-permute-requant pass -- here ``ssm_beta``/
+    ``ssm_alpha`` are Q4_K instead of F32 and are row-permuted while still packed, which
+    is safe because whole quant rows move). The router and shared-expert gate dequantize
+    to bf16; the shared expert keeps native packed projections. Routed experts are yielded
+    only under ``include_moe_experts`` (resident path): dequantized and merged into the
+    stacked bf16 ``gate_up``/``down`` layout the fused kernel expects -- under offload the
+    engine excludes them and :func:`load_q4_0_expert_sources` streams the packed bytes.
+    """
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.utils import cached_load_hf_config
+
+    _require_tp1("weight loading")
+
+    config = parse_qwen35moe_gguf_config(cached_load_hf_config(model_path))
+    g = config.linear_attention_group()
+    assert g is not None
+    k_dim = g.num_key_heads * g.key_head_dim
+    hd = g.value_head_dim
+    v_dim = g.num_value_heads * hd
+    v2g = _tiled_to_grouped_head_index(g.num_value_heads, g.num_key_heads)
+    v_rows = _row_gather_index(v2g, hd)
+    v_cols = _channel_gather_index(v2g, hd)
+
+    E = config.num_experts
+    I = config.moe_intermediate_size
+    H = config.hidden_size
+    expert_gate_up: list[torch.Tensor] | None = [] if include_moe_experts else None
+    expert_down: list[torch.Tensor] | None = [] if include_moe_experts else None
+
+    for t in iter_gguf_tensors(model_path):
+        name = t.name
+        if name == "token_embd.weight":
+            yield "model.embed_tokens.qweight", t.packed()
+            continue
+        if name == "output_norm.weight":
+            yield "model.norm.weight", _to_bf16(t)
+            continue
+        if name == "output.weight":
+            yield "lm_head.qweight", t.packed()
+            continue
+        if not name.startswith("blk."):
+            continue
+
+        layer = int(name.split(".")[1])
+        if layer >= config.num_layers:
+            continue
+        suffix = name.split(".", 2)[2]
+        base = f"model.layers.{layer}"
+
+        if suffix == "attn_norm.weight":
+            yield f"{base}.input_layernorm.weight", _to_bf16(t)
+        elif suffix == "post_attention_norm.weight":
+            yield f"{base}.post_attention_layernorm.weight", _to_bf16(t)
+
+        elif suffix == "attn_q_norm.weight":
+            yield f"{base}.self_attn.q_norm.weight", _to_bf16(t)
+        elif suffix == "attn_k_norm.weight":
+            yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
+        elif suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
+            part = {"attn_q": 0, "attn_k": 1, "attn_v": 2}[suffix[:6]]
+            yield f"{base}.self_attn.qkv_proj.part{part}.qweight", t.packed()
+        elif suffix == "attn_output.weight":
+            yield f"{base}.self_attn.o_proj.qweight", t.packed()
+
+        elif suffix == "attn_qkv.weight":
+            rows = t.packed()  # [q | k | v_tiled] along the output dim
+            qk, v_tiled = rows[: 2 * k_dim], rows[2 * k_dim :]
+            yield f"{base}.linear_attn.in_proj.part0.qweight", torch.cat(
+                [qk, v_tiled.index_select(0, v_rows)], dim=0
+            ).contiguous()
+        elif suffix == "attn_gate.weight":
+            yield f"{base}.linear_attn.in_proj.part1.qweight", t.packed().index_select(0, v_rows)
+        elif suffix in ("ssm_beta.weight", "ssm_alpha.weight"):
+            part = 2 if suffix.startswith("ssm_beta") else 3
+            permuted = t.packed().index_select(0, v2g).reshape(-1)
+            dense = dequantize(permuted, t.ggml_type, torch.bfloat16).reshape(
+                len(v2g), config.hidden_size
+            )
+            yield f"{base}.linear_attn.in_proj.part{part}.weight", dense.contiguous()
+
+        elif suffix == "ssm_conv1d.weight":
+            conv_idx = torch.cat([torch.arange(2 * k_dim), v_cols + 2 * k_dim])
+            chans = _f32(t).index_select(0, conv_idx)
+            yield f"{base}.linear_attn.conv1d.weight", chans.unsqueeze(1).contiguous().to(
+                torch.bfloat16
+            )
+        elif suffix in ("ssm_dt.bias", "ssm_dt"):
+            yield f"{base}.linear_attn.dt_bias", _f32(t).index_select(0, v2g).contiguous()
+        elif suffix in ("ssm_a", "ssm_a.weight"):
+            a_log = torch.log(_f32(t).neg()).index_select(0, v2g).contiguous()
+            yield f"{base}.linear_attn.A_log", a_log
+        elif suffix == "ssm_norm.weight":
+            yield f"{base}.linear_attn.norm.weight", _to_bf16(t)
+        elif suffix == "ssm_out.weight":
+            from freetoken.kernel.gguf import ggml_dequantize
+
+            w = ggml_dequantize(
+                t.packed().to(device, non_blocking=True),
+                t.ggml_type,
+                H,
+                v_dim,
+                torch.float32,
+            )
+            w = w.index_select(1, v_cols.to(device))
+            yield f"{base}.linear_attn.out_proj.qweight", _requant_q8_0(w, device)
+
+        elif suffix == "ffn_gate_inp.weight":
+            yield f"{base}.mlp.gate.weight", _to_bf16(t)
+        elif suffix == "ffn_gate_inp_shexp.weight":
+            yield f"{base}.mlp.shared_expert_gate.weight", _to_bf16(t)
+        elif suffix == "ffn_gate_shexp.weight":
+            yield f"{base}.mlp.shared_expert.gate_up_proj.part0.qweight", t.packed()
+        elif suffix == "ffn_up_shexp.weight":
+            yield f"{base}.mlp.shared_expert.gate_up_proj.part1.qweight", t.packed()
+        elif suffix == "ffn_down_shexp.weight":
+            yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
+
+        elif suffix in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"):
+            if not include_moe_experts:
+                continue  # offload: streamed by load_q4_0_expert_sources instead
+            if suffix != "ffn_down_exps.weight" and expert_gate_up is not None:
+                # gate|up share one stacked buffer: rows [E*I] each, merged [E, 2I, H].
+                dense = dequantize(
+                    t.packed().reshape(-1), t.ggml_type, torch.bfloat16
+                ).reshape(E, I, H)
+                expert_gate_up.append(dense)
+                if len(expert_gate_up) == 2:
+                    merged = torch.cat(expert_gate_up, dim=1).contiguous()
+                    yield f"{base}.mlp.experts.gate_up_proj.weight", merged
+                    expert_gate_up = []
+            elif suffix == "ffn_down_exps.weight":
+                dense = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16).reshape(
+                    E, H, I
+                )
+                yield f"{base}.mlp.experts.down_proj.weight", dense.contiguous()
+        else:
+            raise ValueError(f"unmapped qwen35moe GGUF tensor: {name}")
+
+
+def is_qwen35moe_gguf_model(config: ModelConfig) -> bool:
+    return "Qwen35MoeGGUFForCausalLM" in getattr(config, "architectures", [])
+
+
+def convert_qwen35moe_to_gguf(model, config: ModelConfig) -> None:
+    """In place, for the offload layout: swap embedding/lm_head/attention/GDN exactly like
+    the dense convert, plus each layer's shared-expert projections. Left dense: the router
+    and shared-expert gate (tiny F32/F16 matrices); the routed experts are NOT allocated
+    here -- an offload model streams them from :class:`OffloadMoeCache` banks."""
+    from freetoken.layers.gguf import GGUFLinear
+
+    path = config.gguf_source_path
+    assert path is not None, "GGUF model config lacks gguf_source_path"
+    types = _gguf_types(path)
+    I = config.shared_expert_intermediate_size
+    H = config.hidden_size
+
+    _convert_attention_stack(model, config, types)
+
+    for layer in model.model.layers.op_list:
+        lid = layer._layer_id
+        mlp = layer.mlp
+        mlp.shared_expert.gate_up_proj = GGUFMergedLinear(
+            H,
+            [
+                (I, types[f"blk.{lid}.ffn_gate_shexp.weight"]),
+                (I, types[f"blk.{lid}.ffn_up_shexp.weight"]),
+            ],
+        )
+        mlp.shared_expert.down_proj = GGUFLinear(I, H, types[f"blk.{lid}.ffn_down_shexp.weight"])
+
+
+# --------------------------------------------------------------------------------------
+# Native-GGUF routed-expert offload banks ("q4_0" provider hooks)
+# --------------------------------------------------------------------------------------
+
+
+def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """Per-layer bank shapes for the routed experts' packed ggml block bytes."""
+    from freetoken.models.gguf.dequant import row_bytes
+
+    E = config.num_experts
+    H, I = config.hidden_size, config.moe_intermediate_size
+    gu_type, dn_type = config.expert_gguf_types or (GGML_Q4_0, GGML_Q4_0)
+    return {
+        "gate_up": ((E, 2 * I, row_bytes(H, gu_type)), torch.uint8),
+        "down": ((E, H, row_bytes(I, dn_type)), torch.uint8),
+    }
+
+
+def load_q4_0_expert_sources(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """Per-layer host banks of the routed experts' native ggml block bytes.
+
+    Same contract as gemma4's Q4_0 loader, generalized over the checkpoint's actual
+    per-bank ggml types (:data:`ModelConfig.expert_gguf_types`; Qwen3.x GGUF mixes Q4_K
+    gate/up with Q6_K down): ``gate_up`` merges the separate ``ffn_gate_exps`` +
+    ``ffn_up_exps`` packed rows into one ``[E, 2I, rb(H)]`` bank per layer, ``down`` is
+    ``[E, H, rb(I)]`` verbatim. Whole layers arrive in one shot so the offload cache
+    streams whole experts to the ggml MoE kernels."""
+    from freetoken.models.gguf.dequant import row_bytes
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+
+    _require_tp1("expert banks")
+    L, E = config.num_layers, config.num_experts
+    H, I = config.hidden_size, config.moe_intermediate_size
+    gu_type, dn_type = config.expert_gguf_types or (GGML_Q4_0, GGML_Q4_0)
+    h_bytes = row_bytes(H, gu_type)
+    i_bytes = row_bytes(I, dn_type)
+    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)
+    banks = {name: [b.tensor for b in hb[name]] for name in hb}
+    seen_gu, seen_dn = set(), set()
+
+    def _load(sink) -> None:
+        # gate + up + down: three packed-byte writes complete a layer.
+        tracker = LayerCompletionTracker(3, hb, sink) if sink is not None else None
+        for t in iter_gguf_tensors(model_path):
+            if not t.name.startswith("blk."):
+                continue
+            layer = int(t.name.split(".")[1])
+            suffix = t.name.split(".", 2)[2]
+            if suffix == "ffn_gate_exps.weight":
+                banks["gate_up"][layer][:, :I].copy_(t.packed().reshape(E, I, h_bytes))
+                seen_gu.add(layer)
+            elif suffix == "ffn_up_exps.weight":
+                banks["gate_up"][layer][:, I:].copy_(t.packed().reshape(E, I, h_bytes))
+                seen_gu.add(layer)
+            elif suffix == "ffn_down_exps.weight":
+                banks["down"][layer].copy_(t.packed().reshape(E, H, i_bytes))
+                seen_dn.add(layer)
+            else:
+                continue
+            if tracker is not None:
+                tracker.note(layer)
+
+    if layer_sink is not None:
+        _load(layer_sink)
+    elif torch.cuda.is_available():
+        with PinPipeline() as pins:
+            _load(pins)
+    else:
+        _load(None)
+
+    want = set(range(L))
+    assert seen_gu == want and seen_dn == want, (
+        f"missing expert layers: gate_up {sorted(want - seen_gu)}, down {sorted(want - seen_dn)}"
+    )
+    return banks
+
+
+def dummy_q4_0_expert_sources(config: ModelConfig) -> dict[str, list[torch.Tensor]]:
+    """Random packed-byte expert banks shaped like :func:`load_q4_0_expert_sources` output."""
+    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
+
+    hb = alloc_layer_banks(_q4_0_expert_specs(config), config.num_layers)
+    banks = {name: [b.tensor for b in hb[name]] for name in hb}
+    for t in banks["gate_up"] + banks["down"]:
+        t.random_(0, 256)
+    if torch.cuda.is_available():
+        pin_banks(hb)
+    return banks
 
 
 __all__ = [
@@ -493,6 +908,15 @@ __all__ = [
     "iter_qwen35_gguf_weights",
     "convert_qwen35_to_gguf",
     "is_qwen35_gguf_model",
+    "parse_qwen35moe_gguf_config",
+    "iter_qwen35moe_gguf_weights",
+    "convert_qwen35moe_to_gguf",
+    "is_qwen35moe_gguf_model",
+    "load_q4_0_expert_sources",
+    "dummy_q4_0_expert_sources",
     "GGUFMergedLinear",
     "GGUFLMHead",
 ]
+
+
+

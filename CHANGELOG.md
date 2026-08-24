@@ -25,12 +25,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conversion hooks.
 - `tests/models/test_qwen35_gguf_adapter.py`: permutation round-trips, requant
   layout, registry/tokenizer wiring.
+- **Qwen3.6-35B-A3B MoE GGUF support** (`Qwen35MoeGGUFForCausalLM`, arch
+  `qwen35moe`): loads Ollama/llama.cpp GGUF checkpoints of the routed-MoE GDN
+  hybrid directly. Every decoder layer is a 256-expert top-8 MoE with a gated
+  shared expert; the router and shared-expert gate dequantize to bf16, the shared
+  expert keeps native packed projections, and the routed experts stay packed and
+  stream through the offload banks: `expert_quant="q4_0"` reuses the native-GGUF
+  bank format while new `ModelConfig.expert_gguf_types` carries each bank's actual
+  ggml type (these checkpoints mix Q4_K gate/up with Q6_K down) end-to-end into
+  `ggml_moe_a8_vec` dispatch. Also handles per-layer KV-head arrays (0 on GDN
+  layers), bare `ssm_dt`/`ssm_a` tensor names, Q4_K `ssm_beta`/`ssm_alpha`
+  (row-permuted while still packed), and MTP tensors under the separate `mtp.*`
+  prefix.
+- Torch reference `dequant_q4_k` in the GGUF dequant module (vectorized port of
+  ggml's `dequantize_row_q4_K`, pinned against a scalar loop port in tests).
+- The ROCm quantized-checkpoint guard now admits `expert_quant="q4_0"` (native
+  GGUF K-quants run on the HIP-ported kernels; NVFP4/MXFP4/fp8 remain rejected).
 
 ### Verified
 
 - RX 7900 XTX under WSL2 (Ubuntu 26.04, ROCm 7.x, torch 2.11): coherent generation
   on Qwen3.8-27B-Q4_K_S.gguf at ~13 tok/s decode; full 851-key shape/dtype
   reconciliation against a meta-device build; adapter tests green.
+- Qwen3.6-35B-A3B GGUF (23.9 GB, from the `qwen3.6:35b-a3b_128k` Ollama blob):
+  all 613 offload-layout keys reconcile shape+dtype against a meta-device build;
+  end-to-end greedy generation on GPU at ~14 tok/s steady-state decode (~11.4 tok/s
+  wall average incl. warmup) with `--moe-backend offload --moe-cache-auto`,
+  byte-identical across repeat runs. Same prompt/settings on ollama 0.32.14
+  (embedded llama.cpp): ~51 tok/s decode / ~517 tok/s prefill — the gap is the
+  known RDNA3 Triton matrix-core fallback plus CUDA-graph absence, not the MoE
+  path (see Known limitations).
 
 ### Known limitations
 
@@ -41,3 +65,5 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`no matching matrix core intrinsic` warnings during warmup), making prefill and
   decode markedly slower than hand-tuned HIP stacks such as llama.cpp. CUDA graphs
   remain disabled on ROCm.
+- The MoE GGUF path requires `--moe-backend offload` (engine assertion); resident
+  MoE layers only support bf16/fp8_block formats.

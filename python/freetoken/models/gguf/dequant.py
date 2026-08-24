@@ -85,6 +85,35 @@ def dequant_q4_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return ((q - 8.0) * d).reshape(-1).to(out_dtype)
 
 
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_K: 256-elem super-block = fp16 ``d``/``dmin`` + 12B of 6-bit sub-scales +
+    128B of 4-bit codes (8 sub-blocks of 32, nibble pairs sharing one qs byte).
+    Direct vectorization of ggml's ``dequantize_row_q4_K``."""
+    raw = raw.reshape(-1, 144)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)  # [n,1]
+    dmin = _f16_scales(raw, 2, 4)  # [n,1]
+    scales = raw[:, 4:16]  # [n,12] uint8
+    qs = raw[:, 16:]  # [n,128] uint8
+
+    sc = torch.empty(n, 8, dtype=torch.float32)
+    mn = torch.empty(n, 8, dtype=torch.float32)
+    for j in range(8):
+        if j < 4:
+            sc[:, j] = scales[:, j] & 63
+            mn[:, j] = scales[:, j + 4] & 63
+        else:
+            sc[:, j] = ((scales[:, j + 4] & 0xF) | ((scales[:, j - 4] >> 6) << 4)).float()
+            mn[:, j] = ((scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)).float()
+
+    y = torch.empty(n, 256, dtype=torch.float32)
+    for j in range(8):
+        byte = qs[:, (j // 2) * 32:(j // 2 + 1) * 32]
+        q = (byte & 0xF).float() if j % 2 == 0 else (byte >> 4).float()
+        y[:, j * 32:(j + 1) * 32] = d * sc[:, j:j + 1] * q - dmin * mn[:, j:j + 1]
+    return y.reshape(-1).to(out_dtype)
+
+
 def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """Q6_K: 256-elem super-block = 128B low nibbles + 64B high 2-bits + 16 int8
     sub-scales + fp16 ``d``. Direct vectorization of ggml's two-half loop."""
@@ -133,6 +162,7 @@ _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q8_0: dequant_q8_0,
     GGML_Q6_K: dequant_q6_k,
+    GGML_Q4_K: dequant_q4_k,
 }
 
 
@@ -165,5 +195,6 @@ __all__ = [
     "dequant_q4_0",
     "dequant_q8_0",
     "dequant_q6_k",
+    "dequant_q4_k",
     "dequantize",
 ]

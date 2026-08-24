@@ -222,6 +222,10 @@ class ModelConfig:
     # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +
     # weight_scale_inv per block), also applied to the dense projections.
     expert_quant: str = "none"
+    # Native-GGUF routed-expert quant types (gate_up, down) as ggml type ids, set by GGUF
+    # adapters whose experts stay packed (expert_quant "q4_0"). None = the legacy Q4_0
+    # default every consumer falls back to (gemma4 GGUF).
+    expert_gguf_types: tuple[int, int] | None = None
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
     nvfp4_backend: str = "triton"
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).

@@ -110,11 +110,20 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         super().__init__()
 
         # GGUF checkpoints carry native block-quantized weights: swap the dense
-        # projections + embedding + untied lm_head for GGUF-quant ops.
-        from .gguf import convert_qwen35_to_gguf, is_qwen35_gguf_model
+        # projections + embedding + untied lm_head for GGUF-quant ops (dense), or the
+        # same attention/head stack plus each shared expert (MoE; routed experts stay
+        # packed and stream through the offload banks).
+        from .gguf import (
+            convert_qwen35_to_gguf,
+            convert_qwen35moe_to_gguf,
+            is_qwen35_gguf_model,
+            is_qwen35moe_gguf_model,
+        )
 
         if is_qwen35_gguf_model(config):
             convert_qwen35_to_gguf(self, config)
+        elif is_qwen35moe_gguf_model(config):
+            convert_qwen35moe_to_gguf(self, config)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

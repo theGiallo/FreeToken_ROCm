@@ -115,6 +115,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_qwen35_gguf_config",
         iter_weights="iter_qwen35_gguf_weights",
     ),
+    # GGUF (native Q4_K/Q6_K) MoE qwen3.6 (e.g. 35B-A3B): same classes; routed experts stay
+    # packed and stream through the offload banks (expert_quant="q4_0").
+    "Qwen35MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_qwen35moe_gguf_config",
+        iter_weights="iter_qwen35moe_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",

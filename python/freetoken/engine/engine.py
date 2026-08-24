@@ -1110,11 +1110,16 @@ def _adjust_config(config: EngineConfig):
     if is_rocm():
         # Baseline ROCm serves unquantized (bf16) weights only: every quantized
         # path (nvfp4/marlin, mxfp4 triton GEMMs, fp8 blockwise) bottoms out in
-        # CUDA-specific kernels or PTX that RDNA3 cannot run.
+        # CUDA-specific kernels or PTX that RDNA3 cannot run. Native-GGUF K-quants
+        # are the exception -- their dequant-in-kernel GEMV/MoE paths were ported
+        # to HIP (gguf_kernel + vecdotq), which is exactly what they exist for.
+        def _rocm_supported(q: str) -> bool:
+            return q in ("none", "", None, "q4_0")
+
         unsupported = [
             q
             for q in (("experts", expert_quant), ("attention/dense", attn_quant))
-            if q[1] not in ("none", "", None)
+            if not _rocm_supported(q[1])
         ]
         if unsupported:
             details = ", ".join(f"{part} quant={fmt!r}" for part, fmt in unsupported)
