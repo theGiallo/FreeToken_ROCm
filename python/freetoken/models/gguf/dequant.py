@@ -23,6 +23,8 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +35,8 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +46,8 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -115,8 +121,17 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 codes; ``w = d*q``."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
     GGML_Q6_K: dequant_q6_k,
 }
 
@@ -148,6 +163,7 @@ __all__ = [
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q8_0",
     "dequant_q6_k",
     "dequantize",
 ]

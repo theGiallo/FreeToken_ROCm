@@ -109,6 +109,13 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+        # GGUF checkpoints carry native block-quantized weights: swap the dense
+        # projections + embedding + untied lm_head for GGUF-quant ops.
+        from .gguf import convert_qwen35_to_gguf, is_qwen35_gguf_model
+
+        if is_qwen35_gguf_model(config):
+            convert_qwen35_to_gguf(self, config)
+
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)

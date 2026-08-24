@@ -273,6 +273,10 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # GGUF checkpoints only: path of the source .gguf file, carried so the model's
+    # native-quant conversion hook can read per-tensor ggml types (the packed buffer of
+    # each swapped-in quant layer is sized from its own tensor's type). None otherwise.
+    gguf_source_path: str | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

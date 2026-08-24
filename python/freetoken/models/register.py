@@ -107,6 +107,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF (native Q4_K/Q5_K/Q6_K) dense qwen3.5/3.6 (hybrid GatedDeltaNet / gated full
+    # attention): same model classes, GGUF config + weight loaders.
+    "Qwen35GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_qwen35_gguf_config",
+        iter_weights="iter_qwen35_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
