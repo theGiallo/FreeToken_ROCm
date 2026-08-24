@@ -98,6 +98,15 @@ def ensure_hip_build_env() -> None:
         if arch:
             os.environ["TVM_FFI_ROCM_ARCH_LIST"] = arch
 
+    # torch.utils.cpp_extension reads PYTORCH_ROCM_ARCH for JIT builds; without
+    # it the SDK's full GPU list (~25 arches) is compiled, turning a ~1 min
+    # kernel build into an hour. Restrict to the detected device unless the
+    # user opted into something specific.
+    if "PYTORCH_ROCM_ARCH" not in os.environ:
+        arch = gfx_arch()
+        if arch:
+            os.environ["PYTORCH_ROCM_ARCH"] = arch
+
 
 def _create_linker_symlinks(lib_dir: pathlib.Path) -> None:
     for base in _HIP_LIBS_NEEDING_LINKER_SYMLINK:

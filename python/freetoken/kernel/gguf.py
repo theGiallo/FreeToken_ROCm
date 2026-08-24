@@ -16,6 +16,7 @@ import functools
 import os
 import pathlib
 import shutil
+import sysconfig
 
 import torch
 
@@ -47,8 +48,59 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
+def _stage_hip_sources() -> tuple[pathlib.Path, list[pathlib.Path]]:
+    """Copy the JIT sources onto a native filesystem for HIP builds.
+
+    When the repo lives on a slow mount (e.g. /mnt/* drvfs under WSL2), clang's
+    include lookup storm makes the HIP compile 10-50x slower -- a multi-minute
+    build turns into an hour-long apparent hang. Stage the (few MB of) sources
+    next to torch's extension cache (native ext4) and refresh stale copies.
+    """
+    stage = (
+        pathlib.Path(os.environ.get("TORCH_EXTENSIONS_DIR", "~/.cache/torch_extensions"))
+        .expanduser()
+        / f"gguf_src_stage_{sysconfig.get_platform()}"
+    )
+    inc = stage / "csrc"
+    inc.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(_CSRC / "hip_shim", inc / "hip_shim", dirs_exist_ok=True)
+
+    def _fresh(dst: pathlib.Path, src: pathlib.Path) -> None:
+        if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+            shutil.copy2(src, dst)
+
+    for pattern in ("*.h", "*.cuh", "*.cu", "*.hip"):
+        for f in _CSRC.glob(pattern):
+            _fresh(inc / f.name, f)
+    # The builder appends its own extension to the source name it passes to
+    # hipcc; hand it the staged .cu.
+    return inc / "gguf_kernel.cu", [inc / "hip_shim", inc]
+
 @functools.cache
 def _module():
+    from freetoken.kernel.platform import ensure_hip_build_env, is_rocm
+
+    if is_rocm():
+        # hipcc (clang) compiles host + device in one pass: no nvcc-style host-compiler
+        # dance, no nvcc-only flags. USE_ROCM comes from torch's extension builder and
+        # switches the vendored llama.cpp sources onto their AMD tile/config branches.
+        #
+        # Import order matters: torch's cpp_extension resolves ROCM_HOME once at module
+        # import, so the build env must be prepared FIRST -- otherwise a stray Windows/
+        # system hipcc on PATH leaks in through WSL interop.
+        ensure_hip_build_env()
+        from torch.utils.cpp_extension import load
+
+        src, include_paths = _stage_hip_sources()
+        return load(
+            name="freetoken_gguf_kernels",
+            sources=[str(src)],
+            extra_include_paths=[str(p) for p in include_paths],
+            extra_cuda_cflags=["-O3"],
+            verbose=True,
+        )
+
     from torch.utils.cpp_extension import load
 
     extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
