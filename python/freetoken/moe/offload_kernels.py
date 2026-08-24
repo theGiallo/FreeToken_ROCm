@@ -429,3 +429,45 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+@triton.jit(do_not_specialize=["slot_start", "num_slots"])
+def _invalidate_slot_range_kernel(
+    id_of_slot_ptr,   # [cache_size]: owner expert id per slot (-1 = free)
+    slot_for_id_ptr,  # [num_layers * num_experts] flattened
+    usage_ptr,        # [cache_size]
+    slot_start,
+    num_slots,
+    BLOCK: tl.constexpr,
+):
+    """Device-side invalidation of a contiguous slot range (prefill double buffers).
+
+    Frees every expert-id mapping owned by [slot_start, slot_start + num_slots),
+    marks those slots unused (usage=0 keeps them the argmin-eviction victims), and
+    clears their owner ids -- all without the host sync the boolean-mask indexing
+    formulation used to pay (hidden nonzero -> D2H) once per prefilled layer."""
+    off = tl.arange(0, BLOCK)
+    m = off < num_slots
+    oid = tl.load(id_of_slot_ptr + slot_start + off, mask=m, other=-1)
+    tl.store(slot_for_id_ptr + oid, -1, mask=m & (oid >= 0))
+    tl.store(id_of_slot_ptr + slot_start + off, -1, mask=m)
+    tl.store(usage_ptr + slot_start + off, 0, mask=m)
+
+
+def invalidate_slot_range(cache, slot_start: int, num_slots: int) -> None:
+    """Free ``[slot_start, slot_start + num_slots)`` of the slot cache (see kernel)."""
+    if cache.device.type != "cpu":
+        block = triton.next_power_of_2(num_slots)
+        _invalidate_slot_range_kernel[(1,)](
+            cache.id_of_slot,
+            cache.slot_for_id.view(-1),
+            cache.usage,
+            slot_start,
+            num_slots,
+            BLOCK=block,
+        )
+        return
+    old_ids = cache.id_of_slot[slot_start:slot_start + num_slots]
+    cache.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
+    old_ids.fill_(-1)
+    cache.usage[slot_start:slot_start + num_slots].zero_()

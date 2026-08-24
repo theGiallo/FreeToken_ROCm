@@ -51,6 +51,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   k-wide softmax (softmax-then-renormalize cancels the global denominator), removing
   the full-vocab fp32 copy + softmax — ~60 fewer eager launches per token on the
   fallback router (Windows/ROCm). Expert ids verified bitwise-equal to the old path.
+- Device-side `_invalidate_prefill_buffer` (`invalidate_slot_range` Triton kernel +
+  CPU-reference fallback): the old boolean-mask indexing formulation hid a nonzero
+  D2H per call — 40 queue-draining host syncs per prefill on Qwen3.6-35B. Short-bench
+  prefill telemetry improved ~15-20% (~20 -> ~23.7 tok/s at 39 tokens); decode
+  unchanged, as expected.
 
 ### Verified
 

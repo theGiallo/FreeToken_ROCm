@@ -161,3 +161,33 @@ same-card llama.cpp fully-resident run.
      the 40x nonzero stalls also gate prefill overlap quality.
   3. Attention split-K MFMA shapes on gfx1100 (compile failure -> fallback).
   4. Larger captured graph sizes for multi-request serving (only bs=1 captured here).
+
+## 7. Follow-up session (post-graphs): miss-rate measurement closes the hybrid question
+
+With graphs landed, the ranked levers were re-tested against data:
+
+- **Prefill sync removal — DONE.** `_invalidate_prefill_buffer` now calls a
+  device-side `invalidate_slot_range` Triton kernel (single program, BLOCK =
+  num_experts; frees owner ids, clears usage, no host readback) with a torch-op
+  fallback for CPU-resident test caches. The old formulation's boolean-mask
+  indexing hid one nonzero-D2H per prefilled layer (40/prefill here). Short-bench
+  prefill telemetry: ~20 -> ~23.7 tok/s (+15-20% at 39 tokens); decode unchanged.
+  `tests/moe/{test_prefill_hit_d2d,test_offload,test_fused_copy,test_hybrid_fetch}.py`
+  all green (23 passed, 6 skipped).
+- **Hybrid MoE backend — CLOSED, not worth it on this workload.** Two facts:
+  1. Load-time blocker: the CPU executor only parses strict Q4_0 rows
+     (`cpu_executor.py:_resolve_q4_0_banks`, 18 B/32 K); our Qwen3.6 GGUF banks are
+     mixed K-quants (gate/up Q4_K = 144 B/256 K, down Q6_K = 210 B/256 K), so
+     `LLM(..., moe_backend="hybrid")` asserts out. Enabling it would require new
+     CPU W4A16 GEMV kernels for Q4_K/Q6_K in csrc/cpu_moe/cpu_moe_ext.cpp.
+  2. Payoff bound that kills it: with `moe_collect_stats=True`, the long bench
+     (4096 slots = 39% of experts) measured **decode miss_rate = 9%**
+     (0.7 missing of 8 active experts/step) — miss traffic is ~1.4 MB/token,
+     ~0.1 ms at PCIe bandwidth. Even a perfect hybrid would move decode <1%.
+     Sanity anchor for the other extreme: forcing `moe_cache_size=512`
+     (all-miss decode) drops steady-state from ~37 to ~16 tok/s, confirming
+     misses only matter when the cache actually thrashes — ours does not.
+- **Conclusion:** remaining decode time is hit-path GPU work + fixed overheads.
+  Next candidates if more speed is ever needed: attention split-K MFMA shapes on
+  gfx1100, larger graph sizes for bs>1 serving, and GPU GEMV efficiency of the
+  q4_K/q6_K expert kernels.
