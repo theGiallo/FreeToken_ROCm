@@ -66,7 +66,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   e2e 40.0 -> **52.68 tok/s** (+32%) at unchanged VRAM. Reference re-measurement
   (same file, ctx that fits VRAM) puts llama.cpp at 107.9 tok/s and ollama at
   103.5 — the previously reported ~50 tok/s reference was an artifact of the
-  `_128k` tag forcing partial offload via `num_ctx=131072`.
+   `_128k` tag forcing partial offload via `num_ctx=131072`.
+- **Fused Triton router top-k** (`kernel/triton/router_topk.py`): replaces the
+  pure-torch fallback chain (`torch.topk` + k-wide `softmax` + dtype/contiguity
+  casts — ~5 kernel launches per MoE layer per generated token, ~180 at 36 layers)
+  with a single Triton launch per token row: iterative argmax extraction of the
+  top-k experts + inline renormalize-softmax. Kill switch `FREETOKEN_TORCH_TOPK=1`.
+  Warm e2e on Qwen3.6-35B-A3B: 57.2 -> **59.5 tok/s** (+4.0%), steady decode
+  windows 77-79 -> **83-84 tok/s** (~0.4 ms/tok saved on gfx1100).
 - **Portable prefill hit-D2D miss path** (`OffloadMoeCache._copy_miss_rows_portable`):
   the prefill hit/miss split no longer requires `cudaMemcpyBatchAsync` (CUDA >= 13) —
   where that API is unavailable (ROCm, older CUDA, failed JIT build) miss rows cross
@@ -85,13 +92,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Qwen3.6-35B-A3B GGUF (23.9 GB, from the `qwen3.6:35b-a3b_128k` Ollama blob):
   all 613 offload-layout keys reconcile shape+dtype against a meta-device build;
   end-to-end greedy generation byte-identical across repeat runs, with and without
-  CUDA graphs. With graphs + the skinny-linear GEMV: short-prompt decode
-  **45.2 tok/s wall cold / 52.7 warm** (was 35/40 before the GEMV fix); kernel
-  trace shows decode fully GPU-bound at 12.39 ms/token device-busy. Three-way
+  CUDA graphs. With graphs + the skinny-linear GEMV + fused router top-k +
+  prefill hit-D2D: short-prompt decode
+  **44.8 tok/s wall cold / 59.5 warm** (was 35/40 before optimizations); steady
+  decode windows **83-84 tok/s** (~12.0 ms/token device-busy). Three-way
   reference on identical workloads (see `BENCHMARK_RESULTS.md` UPDATE 2):
-  llama.cpp b10615+PR#25334 **107.9 tok/s @ 21.6 GiB**, ollama **103.5 @ 22.7 GiB**,
-  FreeToken **52.7 @ ~22.1 GiB** — next headroom is ~6.5 ms/token of host-side
-  time between graph replays, not GPU work.
+   llama.cpp b10615+PR#25334 **107.9 tok/s @ 21.6 GiB**, ollama **103.5 @ 22.7 GiB**,
+   FreeToken **59.5 @ ~22.1 GiB** — remaining gap vs llama.cpp's 107.9 is
+   mostly irreducible: ~4.6 ms/tok of thin rocBLAS GEMMs (un-attributed ×60/tok),
+   quantize_q8_1 activation overhead, and PCIe fetch of cache-miss experts.
 
 ### Known limitations
 

@@ -53,6 +53,14 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
+    # One-launch fused router (top-k + renorm softmax): exact on the renormalize
+    # fast path's semantics, so it can serve before any fallback is considered.
+    if renormalize and num_token_non_padded is None:
+        from freetoken.kernel.triton.router_topk import router_topk_softmax, router_topk_supported
+
+        if router_topk_supported(gating_output, topk):
+            return router_topk_softmax(gating_output, topk)
+
     from freetoken.kernel.backend import is_triton_kernels_installed
 
     # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
