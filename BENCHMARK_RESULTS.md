@@ -106,3 +106,113 @@ Also landed: `_torch_fused_topk` fast path (renormalize=True routes via top-k on
 raw logits + k-wide softmax — mathematically identical, verified bitwise-equal
 expert ids across shapes/scales). No measurable e2e delta once graphs are on,
 but it removes ~60 eager launches/token for any eager-fallback user.
+
+---
+
+# UPDATE 2 — true reference, kernel-level attribution, skinny-linear fix
+
+## The "~1.16× gap" above was measured against a crippled reference
+
+The ollama runs above used tag `qwen3.6:35b-a3b_128k`, which sets
+`num_ctx=131072` (`ollama show` confirms). That KV reservation forces llama.cpp
+into **partial expert offload** even on a 24 GB card, capping it at ~50 tok/s —
+i.e. we were comparing our full-GPU-resident design point against *their*
+offload design point. With `num_ctx` sized to fit (the plain `qwen3.6:35b-a3b`
+tag / explicit `-c`), the same hardware does ~104–108 tok/s.
+
+## Procedure for all numbers below (2026-08-25)
+
+Identical workload per engine, single stream, greedy, Windows host:
+
+1. **llama.cpp** (master `f280b2698` = b10615 + cherry-picked upstream PR #25334,
+   which fixes qwen35 Ollama-GGUF loading): `llama-server -m <blob> --jinja
+   -fa on -ngl 999 -c 65536 --no-warmup -p 8090`; one warmup chat completion +
+   one measured completion (21-token prompt, `n_predict=256`); perf recap read
+   from server log (`eval time … / 256 tokens`). Peak VRAM sampled at 50 Hz via
+   `\GPU Process Memory(pid_*)\Dedicated Usage`.
+2. **ollama** (`qwen3.6:35b-a3b`, default ctx): same prompt shape through
+   `/api/chat`; tok/s from `eval_count/eval_duration`. VRAM attributed to the
+   embedded engine process (`...\AMD\AI_Bundle\Ollama\lib\ollama\llama-server.exe`),
+   *not* the `ollama.exe` front-end.
+3. **FreeToken**: e2e script, two consecutive generate() calls of 256 tokens on
+   the same engine; report both (run 1 includes cold LRU fill).
+
+Model file identical throughout (the Ollama blob, 23,938,321,664 B).
+
+## Three-way results (before today's fix)
+
+| Engine | Decode | Peak VRAM |
+|---|---|---|
+| llama.cpp b10615+#25334 | **107.9 tok/s** (9.27 ms/tok) | 22,135 MB (21.6 GiB) |
+| ollama 0.32.14 | **103.5 tok/s** | 23,281 MB (22.7 GiB) |
+| FreeToken @ graphs-on baseline | 34.8–40.0 tok/s wall (steady windows ~54) | ~22.1 GiB (1.8 GiB free) |
+
+Real gap ≈ **2×**, not 1.16×.
+
+## Where decode time actually goes (chrome trace, graphs on, bs=1)
+
+torch.profiler over a decode-only window (383 tokens), prefill mega-events
+filtered (>400 µs). Device-busy totals matched engine telemetry, i.e. graph-mode
+decode is GPU-bound, not dispatch-bound.
+
+Before the fix — **18.12 ms/tok**:
+
+| ms/tok | ×/tok | kernel | verdict |
+|---|---|---|---|
+| 5.51 | 40 | rocBLAS `Cijk_Ailk…MT128x32x16` (one per MoE layer, `aten::linear`) | 🔴 pathological pick |
+| 1.71 | 170 | ggml `mul_mat_vec_q` Q4_K (resident projections) | legit |
+| 1.59 | 100 | rocBLAS thin `Cijk…MT32x32x32` | mediocre |
+| 1.04 | 332 | `quantize_q8_1` (activation quant for ggml kernels) | semi-legit |
+| 0.99 | 40 | `fast_index_copy_multi` (PCIe expert misses) | coverage-bound |
+| 0.91 | 120 | router top-K chain (`warpMergeSortTopK`+`bitonicSortKVInPlace`) | torch fallback |
+| 1.35 | 80 | `moe_vec_q` Q4_K/Q6_K (the actual routed-expert math) | legit |
+
+Standalone microbench pinned the 🔴 item: **every** dispatch route
+(`F.linear`, `mm`, `mv`) sends `[1,K]×[K,1]` shapes to the same ~157 µs fat
+kernel — a 4 KB weight read taking 157 µs. Per MoE layer the shared-expert gate
+(`LinearReplicated(2048→1)`) pays this once ⇒ 40 × ~138 µs ≈ the entire 5.5 ms.
+(The earlier full-coverage experiment — `FT_MOE_CACHE=10496`, 97% slot coverage —
+moved wall speed 39.93→40.15 tok/s, i.e. nothing: the PCIe-miss cost is real but
+small, contradicting PERF_INVESTIGATION_PLAN §7 whose "~1.4 MB/token" estimate
+forgot the ×40-layers factor; correct worst case is ~57 MB/token ≈ 4.5 ms, and
+in practice far less because misses are rare and the copy kernel is cheap.)
+
+## Fix: Triton GEMV for M==1 linears
+
+New `kernel/triton/skinny_linear.py`: bandwidth-bound single-row matvec (fp32
+accumulate), dispatched from `_LinearTPImpl.forward` (covers `LinearReplicated`,
+col/row-parallel merged projections) whenever `x.shape[0]==1` on CUDA bf16/fp16;
+everything else falls through to `F.linear` unchanged. Kill switch:
+`FREETOKEN_SKINNY_LINEAR=0`.
+
+After — **12.39 ms/tok** device-busy (−5.7): fat Cijk gone from decode entirely;
+`_gemv_kernel` ×80/tok costs 0.79 ms total (~10 µs/call incl. the previously
+fat shapes).
+
+## End-to-end after the fix
+
+| Run | Wall decode | VRAM free |
+|---|---|---|
+| 1 (cold LRU) | **45.23 tok/s** | 1.7 / 23.9 GiB |
+| 2 (warm) | **52.68 tok/s** | 1.7 / 23.9 GiB |
+
+Baseline was 35.1 / 40.0 tok/s ⇒ **+32 % warm**, VRAM unchanged. Tests:
+`tests/moe` 14 pre-existing failures unchanged (identical counts with change
+stashed); adapter tests pass; no new failures anywhere.
+
+## Remaining known headroom
+
+- Wall-vs-device gap: e2e wall is 19.0 ms/tok vs 12.4 ms/tok device-busy ⇒
+  ~6.5 ms/token of host-side work between graph replays (scheduler/sampler/
+  detokenize path) — under the profiler the same loop sustains ~70 tok/s wall,
+  so this overhead is measurable and worth a dedicated pass.
+- Router top-K chain ~0.9 ms/tok (pure-torch fallback; `triton_kernels` wheel
+  unavailable on this stack).
+- The post-fix `_gemv_kernel` ×80/tok accounts for the router + shared-expert
+  gate (`LinearReplicated` pairs); the shared expert's gate_up/down were already
+  ggml-vec-kernel territory (inside the `mul_mat_vec_q` counts), and the residual
+  ×60/tok thin rocBLAS calls are un-attributed (graph replay drops cpu-side
+  correlation) — worth one more identification pass.
+- Expert-slot coverage: auto picks ~9.5k/10.75k slots (88–90 %); misses cost
+  ≤1 ms/token at current rates. Full coverage does not fit alongside KV at
+  default `memory_ratio`; not worth forcing given the measured impact.

@@ -5,6 +5,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from freetoken.distributed import DistributedCommunicator, get_tp_info
+from freetoken.kernel.triton.skinny_linear import skinny_linear_forward
 from freetoken.utils import div_even
 
 from .base import BaseOP
@@ -29,7 +30,10 @@ class _LinearTPImpl(BaseOP):
         self.bias = torch.empty(local_osize) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        # M==1 decode steps: rocBLAS picks a pathologically slow tiled GEMM for
+        # skinny replicated linears (router/shared-expert gates); use the Triton
+        # GEMV instead (falls back to F.linear for every other case).
+        return skinny_linear_forward(x, self.weight, self.bias)
 
 
 class LinearReplicated(_LinearTPImpl):
@@ -100,7 +104,7 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = skinny_linear_forward(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
@@ -121,7 +125,7 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = skinny_linear_forward(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y

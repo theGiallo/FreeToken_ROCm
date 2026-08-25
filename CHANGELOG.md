@@ -56,6 +56,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   D2H per call — 40 queue-draining host syncs per prefill on Qwen3.6-35B. Short-bench
   prefill telemetry improved ~15-20% (~20 -> ~23.7 tok/s at 39 tokens); decode
   unchanged, as expected.
+- **Skinny-linear Triton GEMV** (`kernel/triton/skinny_linear.py`, dispatched from
+  `_LinearTPImpl.forward` for `x.shape[0]==1` CUDA bf16/fp16, kill switch
+  `FREETOKEN_SKINNY_LINEAR=0`): rocBLAS routes every `[1,K]` replicated linear
+  (MoE router gate, shared-expert gate) to a tiled Cijk GEMM costing ~138-157 us
+  per call — for a 4 KB weight read — on gfx1100; identical across
+  `F.linear`/`mm`/`mv`. The bandwidth-bound Triton matvec removes 5.7 ms/token of
+  device time on Qwen3.6-35B-A3B decode: device-busy 18.12 -> 12.39 ms/tok, warm
+  e2e 40.0 -> **52.68 tok/s** (+32%) at unchanged VRAM. Reference re-measurement
+  (same file, ctx that fits VRAM) puts llama.cpp at 107.9 tok/s and ollama at
+  103.5 — the previously reported ~50 tok/s reference was an artifact of the
+  `_128k` tag forcing partial offload via `num_ctx=131072`.
 
 ### Verified
 
@@ -65,12 +76,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Qwen3.6-35B-A3B GGUF (23.9 GB, from the `qwen3.6:35b-a3b_128k` Ollama blob):
   all 613 offload-layout keys reconcile shape+dtype against a meta-device build;
   end-to-end greedy generation byte-identical across repeat runs, with and without
-  CUDA graphs. With graphs (now default): short-prompt decode 33-38 tok/s wall /
-  52-53 tok/s steady-state; long-context (517-token prompt, 8k max output)
-  ~33.5 tok/s wall / ~37.5 tok/s decode-only, flat across context. Same
-  prompt/settings on ollama 0.32.14 (embedded llama.cpp, model fully VRAM-resident):
-  ~44-51 tok/s decode — remaining gap ~1.16x at long context. Full numbers and the
-  profiling trail: `BENCHMARK_RESULTS.md`, `PERF_INVESTIGATION_PLAN.md`.
+  CUDA graphs. With graphs + the skinny-linear GEMV: short-prompt decode
+  **45.2 tok/s wall cold / 52.7 warm** (was 35/40 before the GEMV fix); kernel
+  trace shows decode fully GPU-bound at 12.39 ms/token device-busy. Three-way
+  reference on identical workloads (see `BENCHMARK_RESULTS.md` UPDATE 2):
+  llama.cpp b10615+PR#25334 **107.9 tok/s @ 21.6 GiB**, ollama **103.5 @ 22.7 GiB**,
+  FreeToken **52.7 @ ~22.1 GiB** — next headroom is ~6.5 ms/token of host-side
+  time between graph replays, not GPU work.
 
 ### Known limitations
 

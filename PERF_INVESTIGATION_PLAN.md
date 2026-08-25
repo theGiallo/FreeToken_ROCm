@@ -191,3 +191,31 @@ With graphs landed, the ranked levers were re-tested against data:
   Next candidates if more speed is ever needed: attention split-K MFMA shapes on
   gfx1100, larger graph sizes for bs>1 serving, and GPU GEMV efficiency of the
   q4_K/q6_K expert kernels.
+
+## 8. Correction to §7 + the real post-graphs bottleneck (2026-08-25)
+
+Two errors in the reasoning above, both caught by later measurement:
+
+1. **§7's miss-traffic arithmetic was wrong by ×40.** "0.7 missing experts/step
+   ≈ 1.4 MB/token" counted ONE layer; the correct figure is per-layer bytes
+   (≈2.04 MB/expert instance: Q4_K gate/up row 1024×1152 B + Q6_K down row
+   2048×420 B) × 40 layers ⇒ ~57 MB/token at 9% misses, ~4.5 ms at PCIe random-
+   gather bandwidth. The hybrid-closure *verdict* survives anyway — see (2).
+2. **The measured miss cost is far below that bound.** Raising slot coverage
+   88% → 97.5% (`FT_MOE_CACHE=10496`) moved warm wall speed 39.93 → 40.15 tok/s:
+   statistically nothing. The `fast_index_copy_multi` kernel shows up at
+   ~25 µs/layer regardless of miss count in traces, i.e. launch/latency-bound,
+   not bandwidth-bound at these sizes.
+
+The actual dominant term was found by chrome-tracing a decode-only window
+(graphs on): **5.5 ms/token went to one rocBLAS tiled-GEMM kernel picked for
+every `[1,K]` replicated linear** (MoE router gate, shared-expert gate) —
+~138 µs per call for a 4 KB weight read, identical across `F.linear`/`mm`/`mv`
+dispatch. Fixed with a Triton GEMV specialization (`kernel/triton/skinny_linear.py`,
+dispatched from `_LinearTPImpl.forward`): device-busy decode 18.12 → 12.39 ms/tok,
+warm e2e 40.0 → **52.68 tok/s** (+32%), VRAM unchanged. Full data and the
+three-way reference re-measurement (llama.cpp 107.9 / ollama 103.5 / FreeToken
+52.7 on identical workloads) live in `BENCHMARK_RESULTS.md` UPDATE 2. Remaining
+headroom: ~6.5 ms/token host-side between graph replays (wall vs device-busy),
+router top-K torch fallback (~0.9 ms), residual unattributed thin rocBLAS calls
+(~0.9 ms).
