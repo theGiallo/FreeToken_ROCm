@@ -576,16 +576,16 @@ def parse_args(
         ),
     )
 
+    assert ServerArgs.moe_prefill_hit_d2d == True
     parser.add_argument(
-        "--moe-prefill-hit-d2d",
-        action="store_true",
+        "--disable-moe-prefill-hit-d2d",
+        action="store_false",
         dest="moe_prefill_hit_d2d",
-        default=ServerArgs.moe_prefill_hit_d2d,
         help=(
-            "During prefill prefetch, copy cache-resident experts device-side into "
-            "the double buffer and stream only the misses over PCIe "
-            "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
-            "--moe-cache-size > 2 * num_experts."
+            "During prefill prefetch, cache-resident experts are copied device-side "
+            "into the double buffer and only the misses stream over PCIe (batched "
+            "via cudaMemcpyBatchAsync on CUDA >= 13.0, per-run async copies "
+            "elsewhere). Effective with --moe-cache-size > 2 * num_experts."
         ),
     )
 

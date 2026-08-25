@@ -202,10 +202,19 @@ stashed); adapter tests pass; no new failures anywhere.
 
 ## Remaining known headroom
 
-- Wall-vs-device gap: e2e wall is 19.0 ms/tok vs 12.4 ms/tok device-busy ⇒
-  ~6.5 ms/token of host-side work between graph replays (scheduler/sampler/
-  detokenize path) — under the profiler the same loop sustains ~70 tok/s wall,
-  so this overhead is measurable and worth a dedicated pass.
+- Decode-loop telemetry confirms the graph-replay cadence itself runs at
+  **79–80 tok/s steady** (≈ the 12.4 ms device-busy figure); the earlier
+  "wall 19 ms/tok" arithmetic was polluted by ~1.6 s of *prefill* amortized
+  into short 256-token runs. The dominant UX lever is therefore **prefill**
+  (11–24 tok/s here vs ollama's 622): every prefilled layer streams ALL
+  experts over PCIe (~20 GB ≈ 1.56 s) even though ~90% are slot-cache hits.
+   `--disable-moe-prefill-hit-d2d` (default on) now covers this: hits are
+   gathered D2D and misses cross PCIe as per-run async copies where
+   `cudaMemcpyBatchAsync` (CUDA ≥ 13) is unavailable (e.g. ROCm). Measured
+   e2e on this workload: warm run 52.7 -> 57.2 tok/s; the gain is bounded
+   because a 39-token prefill routes ~312 (token, expert) pairs per layer,
+   touching nearly all 256 experts (~0% hit rate) — long prompts behave the
+   same, so prefill remains PCIe-bound by construction.
 - Router top-K chain ~0.9 ms/tok (pure-torch fallback; `triton_kernels` wheel
   unavailable on this stack).
 - The post-fix `_gemv_kernel` ×80/tok accounts for the router + shared-expert

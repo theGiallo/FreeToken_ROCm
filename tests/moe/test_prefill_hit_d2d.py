@@ -129,6 +129,52 @@ def test_prefill_hit_d2d_pure_extremes(nhit):
 
 
 @CUDA
+@pytest.mark.parametrize("nhit", [0, 1, E])
+def test_prefill_hit_d2d_portable_miss_copies(nhit):
+    """Same contract as the batch-API variant, exercised through the portable
+    per-run ``copy_`` miss path (forced via the ``_batch_memcpy = False``
+    unavailable sentinel), including a BIG bank (>= 256 KiB rows) so the D2D
+    gather and the sliced miss runs are both real."""
+    big_feat = 256 * 1024 // 2  # elements of bf16 == exactly _SMALL_BANK_FEAT_BYTES
+    sources = {
+        "gate_up": [
+            torch.randn(E, big_feat, dtype=torch.bfloat16).pin_memory()
+            for _ in range(NUM_LAYERS)
+        ],
+        "down": [torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+    }
+    # Extra hit-region headroom: a slot holds one flat expert's bytes, so layer 0's
+    # all-hits case and layer 1's residents need disjoint slots.
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS,
+        num_experts=E,
+        cache_size=4 * E,
+        device=torch.device("cuda"),
+        prefill_overlap=True,
+        prefill_hit_d2d=True,
+    )
+    cache.set_bank_sources(sources)
+    assert cache._copy_fused_ok
+    assert cache._gather_dst_ptrs is not None  # the big bank must be gather-served
+    cache._batch_memcpy = False  # unavailable sentinel -> portable mode
+
+    _seed_resident(cache, sources, layer_id=1, expert_id=1, slot=3 * E + 1)
+    _seed_resident(cache, sources, layer_id=1, expert_id=3, slot=3 * E + 3)
+    for e in range(nhit):
+        _seed_resident(cache, sources, layer_id=0, expert_id=e, slot=2 * E + e)
+
+    cache.begin_prefill()
+    assert cache._prefill_hit_d2d_active
+    for layer_id in (0, 1):
+        views = cache.wait_prefill_layer(layer_id)
+        torch.cuda.synchronize()
+        for view, (name, per_layer) in zip(views, sources.items()):
+            assert torch.equal(view.cpu(), per_layer[layer_id]), (layer_id, name)
+        cache.release_prefill_layer(layer_id)
+    assert cache.prefill_hit_rows == nhit + 2
+
+
+@CUDA
 def test_prefill_hit_d2d_noop_without_spare_slots():
     dev = torch.device("cuda")
     sources = {

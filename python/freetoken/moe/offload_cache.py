@@ -636,8 +636,6 @@ class OffloadMoeCache:
                 f"cache_size {self.cache_size} leaves no hit region "
                 f"(needs > {2 * self.num_experts} slots)"
             )
-        elif not self._resolve_batch_memcpy():
-            reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
         else:
             return True
         if not self._hit_d2d_fallback_logged:
@@ -649,13 +647,23 @@ class OffloadMoeCache:
         return False
 
     def _resolve_batch_memcpy(self) -> bool:
+        """True when the one-call ``cudaMemcpyBatchAsync`` miss path is available.
+
+        When it is not (CUDA < 13, ROCm, failed JIT build), the split still runs:
+        miss rows fall back to per-run sliced pinned->device ``copy_`` calls on
+        the prefill copy stream (:meth:`_copy_miss_rows_portable`), which costs a
+        handful of small launches per layer instead of one batched call.
+        """
         if self._batch_memcpy is None:
             try:
                 from freetoken.kernel.batch_memcpy import load_batch_memcpy
 
                 self._batch_memcpy = load_batch_memcpy()
-            except Exception as exc:  # noqa: BLE001 -- any build/runtime gap => legacy path
-                logger.warning(f"MoE prefill hit-D2D disabled ({exc}); using full-layer copies")
+            except Exception as exc:  # noqa: BLE001 -- any build/runtime gap => portable path
+                logger.info(
+                    f"MoE prefill hit-D2D: cudaMemcpyBatchAsync unavailable ({exc}); "
+                    "using per-run async copies for miss rows"
+                )
                 self._batch_memcpy = False
         return self._batch_memcpy is not False
 
@@ -667,10 +675,12 @@ class OffloadMoeCache:
         fixed-shape gather indices (no host round trip), then fast_index_copy_multi
         moves the rows. Serializing the gather before this layer's GEMMs costs its
         plain duration instead of nondeterministic SM contention. Misses cross
-        PCIe as ONE cudaMemcpyBatchAsync of coalesced expert-id runs on the copy
-        stream, under the existing release/ready event discipline; its host-built
-        run list comes from the begin-of-chunk snapshot because the batch API
-        takes HOST pointer arrays. Live-vs-snapshot cannot disagree: the only
+        PCIe on the copy stream under the existing release/ready event discipline
+        -- as ONE cudaMemcpyBatchAsync of coalesced expert-id runs where that API
+        exists, else as per-run sliced async ``copy_`` calls (see
+        :meth:`_copy_miss_rows_portable`). The host-built run list comes from the
+        begin-of-chunk snapshot because the batch API takes HOST pointer arrays.
+        Live-vs-snapshot cannot disagree: the only
         chunk-internal writer (buffer invalidation) rewrites slots already below
         the 2E threshold, and slots < 2E (including -1) are misses on both sides
         -- the buffers own those slots, so their bytes are volatile within the
@@ -701,35 +711,66 @@ class OffloadMoeCache:
                 blocks_per_bank=64,
             )
         miss = np.nonzero(~hit_mask)[0]
+        use_batch = self._resolve_batch_memcpy()
+        starts = lengths = None
+        if miss.size:
+            run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
+            starts = miss[run_starts]
+            lengths = np.diff(np.concatenate((run_starts, [miss.size])))
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
             self._invalidate_prefill_buffer(buffer_id)
-            if miss.size:
-                run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
-                starts = miss[run_starts]
-                lengths = np.diff(np.concatenate((run_starts, [miss.size])))
-            dst, src, nbytes = [], [], []
-            for b, feat in enumerate(self._copy_feat_bytes_host):
-                if feat < _SMALL_BANK_FEAT_BYTES:
-                    # Whole layer as one entry, EVEN with zero misses: it keeps every
-                    # batch entry above the driver's async floor and covers the hit
-                    # rows the gather skips for these banks.
-                    dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
-                    src.append(self._copy_src_ptrs_host[layer_id][b])
-                    nbytes.append(E * feat)
-                elif miss.size:
-                    dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
-                    src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
-                    nbytes.extend(lengths * feat)
-            if dst:
-                self._batch_memcpy(
-                    torch.tensor(dst, dtype=torch.int64),
-                    torch.tensor(src, dtype=torch.int64),
-                    torch.tensor(nbytes, dtype=torch.int64),
-                    torch.cuda.current_stream(self.device).cuda_stream,
+            if use_batch:
+                dst, src, nbytes = [], [], []
+                for b, feat in enumerate(self._copy_feat_bytes_host):
+                    if feat < _SMALL_BANK_FEAT_BYTES:
+                        # Whole layer as one entry, EVEN with zero misses: it keeps every
+                        # batch entry above the driver's async floor and covers the hit
+                        # rows the gather skips for these banks.
+                        dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
+                        src.append(self._copy_src_ptrs_host[layer_id][b])
+                        nbytes.append(E * feat)
+                    elif miss.size:
+                        dst.extend(
+                            self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat
+                        )
+                        src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
+                        nbytes.extend(lengths * feat)
+                if dst:
+                    self._batch_memcpy(
+                        torch.tensor(dst, dtype=torch.int64),
+                        torch.tensor(src, dtype=torch.int64),
+                        torch.tensor(nbytes, dtype=torch.int64),
+                        torch.cuda.current_stream(self.device).cuda_stream,
+                    )
+            else:
+                self._copy_miss_rows_portable(
+                    layer_id,
+                    buffer_id,
+                    list(zip(starts.tolist(), lengths.tolist())) if miss.size else [],
                 )
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
+    def _copy_miss_rows_portable(
+        self, layer_id: int, buffer_id: int, runs: list[tuple[int, int]]
+    ) -> None:
+        """Miss-row H2D without ``cudaMemcpyBatchAsync`` (CUDA < 13 / ROCm).
+
+        Small banks copy whole-layer in one sliced ``copy_`` each -- same semantics
+        as the batch path's whole-layer entries. Big banks issue one async pinned
+        copy per coalesced miss run; a prefill chunk has O(tens) of runs per layer,
+        and these overlap compute on the dedicated copy stream, so the extra
+        launches are noise next to the gigabytes they avoid.
+        """
+        for b, feat in enumerate(self._copy_feat_bytes_host):
+            src_layer = self.banks[b][0][layer_id]
+            dst_buf = self.prefill_bank_buffers[b][buffer_id]
+            if feat < _SMALL_BANK_FEAT_BYTES:
+                dst_buf.copy_(src_layer, non_blocking=True)
+                continue
+            for s, ln in runs:
+                dst_buf[s : s + ln].copy_(src_layer[s : s + ln], non_blocking=True)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per

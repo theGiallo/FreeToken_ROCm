@@ -67,6 +67,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (same file, ctx that fits VRAM) puts llama.cpp at 107.9 tok/s and ollama at
   103.5 — the previously reported ~50 tok/s reference was an artifact of the
   `_128k` tag forcing partial offload via `num_ctx=131072`.
+- **Portable prefill hit-D2D miss path** (`OffloadMoeCache._copy_miss_rows_portable`):
+  the prefill hit/miss split no longer requires `cudaMemcpyBatchAsync` (CUDA >= 13) —
+  where that API is unavailable (ROCm, older CUDA, failed JIT build) miss rows cross
+  PCIe as per-run sliced async `copy_` calls on the prefill copy stream (small banks
+  copy whole-layer), and the feature degrades with an info log instead of disabling.
+  `moe_prefill_hit_d2d` now defaults **on** (opt-out `--disable-moe-prefill-hit-d2d`);
+  measured warm e2e on Qwen3.6-35B-A3B: 52.7 -> **57.2 tok/s** (+8.6%). Gain is
+  bounded by near-zero prefill hit rate on short prompts (a 39-token prefill routes
+  ~312 (token, expert) pairs per layer over 256 experts).
 
 ### Verified
 
