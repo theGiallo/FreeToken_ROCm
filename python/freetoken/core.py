@@ -22,6 +22,12 @@ class SamplingParams:
     top_p: float = 1.0
     ignore_eos: bool = False
     max_tokens: int = 1024
+    # Presence penalty (OpenAI semantics): subtract `presence_penalty` from the logit of
+    # every token already generated in the sequence (one hit per distinct token), applied
+    # before temperature/softmax/top-k/top-p. 0.0 disables. Frequency penalty fields are
+    # parsed by the API but presence is the only one wired into the sampler so far.
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)

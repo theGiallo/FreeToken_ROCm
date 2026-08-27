@@ -1940,8 +1940,65 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._ps_reset()
 
     def has_tool_call(self, text: str) -> bool:
-        return "<function=" in text or self.bot_token in text
+        if "<function=" in text or self.bot_token in text or "<parameter=" in text:
+            return True
+        # Drift dialects: a bare tool-name tag (``<bash>``) directly or on the next
+        # line opening a nested parameter structure.  Conservative: this only routes
+        # text toward the tolerant parser, which still returns no calls on prose.
+        return bool(re.search(r"<[\w.-]+\s*>\s*\n?\s*<", text))
 
+    def _normalize_qwen35_drift(self, text: str, tools: List[Tool]) -> str:
+        """Rewrite the drift dialects the model actually emits — a bare function tag
+        (``<bash>`` instead of ``<function=bash>``) with bare (``<command>…</command>``)
+        or canonical (``<parameter=command>…</parameter>``) parameters, with or without
+        the ``<tool_call>`` wrapper — into the canonical form the standard grammar
+        parses.  No-op when the text already uses the canonical ``<function=`` tag."""
+        if "<function=" in text or not text:
+            return text
+        tool_indices = self._get_tool_indices(tools)
+        if not tool_indices:
+            return text
+
+        fn_names = sorted(tool_indices, key=len, reverse=True)
+        param_names = {
+            name: sorted((self._get_param_config(name, tools) or {}).keys(), key=len, reverse=True)
+            for name in fn_names
+        }
+
+        # 1. Bare function openers/closers -> canonical function tags.
+        out = text
+        for nm in fn_names:
+            out = re.sub(rf"<{re.escape(nm)}\s*>", f"<function={nm}>", out)
+            out = re.sub(rf"</{re.escape(nm)}\s*>", "</function>", out)
+
+        # 2. Ensure a single wrapper around the call region, keeping any prose that
+        #    precedes the first function tag as normal text outside the block.
+        if "<tool_call>" not in out:
+            out = out.replace("</tool_call>", "")  # stray orphan closer
+            start = out.find("<function=")
+            if start == -1:
+                return text
+            out = (
+                out[:start]
+                + "<tool_call>\n"
+                + out[start:]
+                + "\n</tool_call>"
+            )
+
+        # 3. Bare parameter tags within each function block -> canonical parameter tags.
+        def _fix_params(block: str) -> str:
+            m = re.match(r"<function=([^>]+)>", block)
+            if not m:
+                return block
+            for p in param_names.get(m.group(1).strip(), ()):
+                block = re.sub(rf"<{re.escape(p)}\s*>", f"<parameter={p}>", block)
+                block = re.sub(rf"</{re.escape(p)}\s*>", "</parameter>", block)
+            return block
+
+        return "".join(
+            _fix_params(part) if part.startswith("<function=") else part
+            for part in re.split(r"(?=<function=)", out)
+        )
 
     def _parse_function_call(self, function_str: str, tools: List[Tool]) -> Optional[ToolCallItem]:
         """Parse a single <function=name>...</function> block into a ToolCallItem."""
@@ -2024,6 +2081,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         return json.dumps(param_dict, ensure_ascii=False)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        text = self._normalize_qwen35_drift(text, tools)
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
 
@@ -3534,6 +3592,7 @@ class FunctionCallParser:
         "muse_glimmer": MuseGlimmerDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
+        "qwen35": Qwen3CoderDetector,
         "qwen3_coder": Qwen3CoderDetector,
     }
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -163,6 +164,8 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -184,6 +187,8 @@ def resolve_sampling(
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        presence_penalty=presence_penalty if presence_penalty is not None else 0.0,
+        frequency_penalty=frequency_penalty if frequency_penalty is not None else 0.0,
     )
 
 
@@ -408,12 +413,50 @@ def _parse_tool_response(
     if not spec.parse_tools:
         return None
     if not any(tag in text for tag in TOOLS_TAG_LIST):
-        return None
-    parser = _make_tool_parser(spec, state)
+        try:
+            parser = _make_tool_parser(spec, state)
+        except ValueError:
+            return None  # unsupported parser name: keep the buffered path's behavior
+        if not parser.has_tool_call(text):
+            return None
+    else:
+        parser = _make_tool_parser(spec, state)
     result = parser.parse_non_stream(text)
     if not result.calls:
         return None
-    return result.normal_text, result.calls
+    unwrapped = []
+    for tc in result.calls:
+        real_name, real_params = _unwrap_standard_tool_calling(tc.parameters, tc.name or "")
+        unwrapped.append(ToolCallItem(
+            tool_index=tc.tool_index, name=real_name, parameters=real_params,
+        ))
+    return result.normal_text, unwrapped
+
+
+def _unwrap_standard_tool_calling(params: str, name: str) -> tuple[str, str]:
+    """Unwrap Qwen3.6's ``standard_tool_calling`` meta-call into the real tool
+    name and arguments.  Returns ``(real_name, real_args_json)`` unchanged when
+    the call is *not* a ``standard_tool_calling`` wrapper."""
+    if name != "standard_tool_calling":
+        return name, params
+    try:
+        outer = json.loads(params)
+    except (json.JSONDecodeError, TypeError):
+        return name, params
+    action = outer.get("action") or outer.get("name") or outer.get("tool")
+    raw_args = outer.get("parameters") or outer.get("arguments") or outer.get("args")
+    if not action:
+        return name, params
+    if isinstance(raw_args, str):
+        try:
+            real_args = json.loads(raw_args)
+        except (json.JSONDecodeError, TypeError):
+            real_args = {"raw": raw_args}
+    elif isinstance(raw_args, dict):
+        real_args = raw_args
+    else:
+        real_args = {}
+    return str(action), json.dumps(real_args, ensure_ascii=False)
 
 
 def _valid_json(text: str) -> bool:
@@ -593,8 +636,11 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         params = open_call["params"]
         if not _valid_json(params):
             params = tool_parser.unstreamed_arguments(open_call["detector_index"]) or params
+        real_name, real_params = _unwrap_standard_tool_calling(
+            params or "{}", open_call["name"]
+        )
         call = ToolCallItem(
-            tool_index=open_call["ordinal"], name=open_call["name"], parameters=params or "{}"
+            tool_index=open_call["ordinal"], name=real_name, parameters=real_params
         )
         open_call = None
         calls_emitted += 1
@@ -602,8 +648,67 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         suppress_ws = True
         return ToolCallsDelta([call])
 
+    def _flush_drift(buf: str, out: list[GenEvent]) -> None:
+        """Flush buffered drift text back through the tolerant one-shot parser and
+        emit it as a complete tool call (drift dialect) or plain content (prose)."""
+        nonlocal drift_buf, calls_emitted, suppress_ws, swallow_trailing_close
+        if not buf:
+            return
+        try:
+            res = tool_parser.detector.detect_and_parse(buf, tool_parser.tools)
+        except Exception:  # noqa: BLE001 — flushing must never break the stream
+            res = None
+        if res is not None and res.calls:
+            if open_call is not None:
+                done = _close_open_call()
+                if done is not None:
+                    out.append(done)
+            for tc in res.calls:
+                real_name, real_params = _unwrap_standard_tool_calling(
+                    tc.parameters, tc.name or ""
+                )
+                out.append(ToolCallsDelta([
+                    ToolCallItem(
+                        tool_index=calls_emitted, name=real_name, parameters=real_params
+                    )
+                ]))
+                calls_emitted += 1
+            if res.normal_text:
+                stripped = strip_special_tokens(res.normal_text, specials)
+                if stripped:
+                    out.append(ContentDelta(stripped))
+            # The wrapper's trailing </tool_call> (and any inter-tag whitespace)
+            # arrives in later fragments and is pure noise after a completed call:
+            # swallow it until real prose appears again.
+            swallow_trailing_close = True
+            drift_buf = ""
+            return
+        if res is not None and res.normal_text:
+            stripped = strip_special_tokens(res.normal_text, specials)
+            s = stripped.strip()
+            if swallow_trailing_close and (not s or s == "</tool_call>"):
+                pass  # orphan wrapper-close noise after a completed call
+            elif s and not (stripped.strip() == "" and suppress_ws):
+                out.append(ContentDelta(stripped))
+                if stripped.strip():
+                    suppress_ws = False
+        drift_buf = ""
+
+    drift_buf = ""
+    swallow_trailing_close = False
+    drift_re = None
+    if tool_parser is not None and tool_parser.tools:
+        names = sorted(
+            {t.function.name for t in tool_parser.tools if t.function.name},
+            key=len, reverse=True,
+        )
+        if names:
+            drift_re = re.compile(
+                r"</(?:function|tool_call|" + "|".join(re.escape(n) for n in names) + r")>"
+            )
+
     def _route_tool_text(piece: str) -> list[GenEvent]:
-        nonlocal open_call, suppress_ws
+        nonlocal open_call, suppress_ws, drift_buf, swallow_trailing_close
         out: list[GenEvent] = []
         if not piece:
             return out
@@ -614,6 +719,20 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                 done = _close_open_call()
                 if done is not None:
                     out.append(done)
+                # Drift dialect (bare <bash>/<parameter=> blocks stream out as text):
+                # hold it until a closing tag or EOS, then re-parse with the tolerant
+                # one-shot parser so the client receives a real tool call instead of
+                # raw markup pasted into content. Plain prose (no '<') still streams live.
+                if "<" in payload or drift_buf:
+                    drift_buf += payload
+                    if drift_re is not None and drift_re.search(drift_buf):
+                        _flush_drift(drift_buf, out)
+                    continue
+                if swallow_trailing_close:
+                    if payload.strip():
+                        swallow_trailing_close = False
+                    else:
+                        continue
                 stripped = strip_special_tokens(payload, specials)
                 if stripped and not (stripped.strip() == "" and suppress_ws):
                     out.append(ContentDelta(stripped))
@@ -717,6 +836,12 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             stripped = strip_special_tokens(residual, specials)
             if stripped and not (stripped.strip() == "" and suppress_ws):
                 yield ContentDelta(stripped)
+        if drift_buf:
+            out: list[GenEvent] = []
+            _flush_drift(drift_buf, out)
+            drift_buf = ""
+            for ev in out:
+                yield ev
         if calls_emitted and finish_reason != "length":
             finish_reason = "tool_calls"
     else:

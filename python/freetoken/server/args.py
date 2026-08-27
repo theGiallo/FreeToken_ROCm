@@ -141,6 +141,7 @@ def parse_args(
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
+            or "qwen35" in marker
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"
@@ -413,6 +414,7 @@ def parse_args(
             "llama3",
             "qwen",
             "qwen25",
+            "qwen35",
             "qwen3_coder",
             "mistral",
             "deepseekv32",

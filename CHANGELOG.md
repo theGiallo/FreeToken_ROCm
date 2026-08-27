@@ -7,6 +7,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`presence_penalty` is now actually applied** (was parsed-but-ignored no-op) for
+  OpenAI/chat completions. Plumbed from the wire request through
+  `SamplingParams.presence_penalty` (`core.py`) and `resolve_sampling`
+  (`generation.py` / `openai_api.py`) into the batch sampler
+  (`engine/sample.py`): `Sampler.prepare` builds a per-row boolean presence mask
+  (one hit per *distinct* token already generated, from each request's sequence)
+  and `Sampler.sample` subtracts the penalty from those logits **before**
+  temperature/softmax/top-k/top-p. Also honored on the greedy (argmax) path.
+  `frequency_penalty` is carried into `SamplingParams` for parity but is still a
+  no-op; `min_p` likewise remains accepted-but-unapplied. Unit-tested in
+  `tests/engine/test_presence_penalty.py`.
+
+### Qwen3.6-35B-A3B tool-call parsing (drift dialects)
+
+- **Tolerant non-streaming parser**: `Qwen3CoderDetector` (`function_call_parser.py`)
+  now normalizes the drift dialects the model emits into the canonical grammar before
+  parsing — a bare function tag (`<bash>` instead of `<function=bash>`) with bare
+  (`<command>…</command>`) or canonical (`<parameter=command>…</parameter>`) parameters,
+  with or without the `<tool_call>` wrapper. `has_tool_call` detects the bare/drift
+  forms; `detect_and_parse` applies `_normalize_qwen35_drift`; the `_parse_tool_response`
+  gate in `generation.py` relaxes to a tolerant `has_tool_call` fallback and unwraps the
+  model's `standard_tool_calling` meta-call into the real tool name/args
+  (`_unwrap_standard_tool_calling`). `args.py` maps the `qwen35` parser alias onto
+  `Qwen3CoderDetector` (and receives qwen35 in `--tool-call-parser`).
+- **Streaming drift handling** (`generation.py` `_generate_events_impl`): bare
+  `<bash>`/`<parameter=>` blocks that stream out as plain text are now held
+  (`drift_buf`) until a closing tag or EOS, then re-parsed with the tolerant one-shot
+  parser and emitted as a real `tool_calls` delta instead of raw markup pasted into
+  content; trailing `</tool_call>`/whitespace noise after a completed call is swallowed
+  (`swallow_trailing_close`). Canonical streaming already yielded
+  `finish_reason=tool_calls` with valid args (19/19, 48-run sweep clean of drift leaks).
+- Test coverage: `tests/test_qwen35_drift.py` (14) + `tests/test_streaming_drift.py` (4).
+
+### Verified
+
 - **HIP port of the GGUF quant kernels** (`mmvq`, `mmq`, MoE, dequantize): the
   vendored llama.cpp-derived CUDA sources now JIT-build with `hipcc` on ROCm,
   enabling quantized GGUF inference on AMD RDNA3 GPUs (gfx1100 tested). Includes a
