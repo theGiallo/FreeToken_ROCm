@@ -76,6 +76,12 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # repeat_penalty (llama.cpp-style multiplicative, 1.0 disables) and min_p (minimum-p
+    # filter, 0.0 disables) are not OpenAI-standard but are accepted/carried so pi's
+    # models.json `repeat_penalty`/`min_p` keys survive `extra="allow"` swallowing. They
+    # default to None so resolve_sampling fills them from the checkpoint's sampling config.
+    repeat_penalty: float | None = None
+    min_p: float | None = None
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
@@ -114,6 +120,8 @@ class CompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    repeat_penalty: float | None = None
+    min_p: float | None = None
     ignore_eos: bool = False
     logprobs: int | None = None
     echo: bool = False

@@ -91,8 +91,9 @@ def load_toolcall_anchor_id(
 
 def load_generation_sampling(model_path: str) -> dict[str, Any]:
     """Recommended sampling defaults from ``generation_config.json`` (sglang's
-    ``sampling_defaults='model'``). Returns ``{temperature, top_k, top_p}`` for the keys
-    present; if the model recommends greedy (``do_sample=false``) returns greedy
+    ``sampling_defaults='model'``). Returns ``{temperature, top_k, top_p, min_p,
+    repeat_penalty}`` for the keys present; if the model recommends greedy
+    (``do_sample=false``) returns greedy
     (``temperature=0``). Empty dict if there is no generation config / no sampling info.
 
     Many reasoning models (e.g. Qwen3.5: temp 1.0, top_k 20, top_p 0.95) ship these here;
@@ -113,6 +114,10 @@ def load_generation_sampling(model_path: str) -> dict[str, Any]:
             out["top_k"] = int(v)
         if (v := meta.get("general.sampling.top_p")) is not None:
             out["top_p"] = float(v)
+        if (v := meta.get("general.sampling.min_p")) is not None:
+            out["min_p"] = float(v)
+        if (v := meta.get("general.sampling.repeat_penalty")) is not None:
+            out["repeat_penalty"] = float(v)
         return out
 
     try:
@@ -122,7 +127,7 @@ def load_generation_sampling(model_path: str) -> dict[str, Any]:
     if getattr(gc, "do_sample", None) is False:
         return {"temperature": 0.0}
     out: dict[str, Any] = {}
-    for key in ("temperature", "top_k", "top_p"):
+    for key in ("temperature", "top_k", "top_p", "min_p", "repeat_penalty"):
         val = getattr(gc, key, None)
         if val is not None:
             out[key] = val

@@ -78,6 +78,8 @@ def chat_request_to_genspec(
             stop=req.stop,
             presence_penalty=req.presence_penalty,
             frequency_penalty=req.frequency_penalty,
+            repeat_penalty=req.repeat_penalty,
+            min_p=req.min_p,
         ),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
@@ -530,6 +532,8 @@ def _resolve_sampling(
         stop=req.stop,
         presence_penalty=req.presence_penalty,
         frequency_penalty=req.frequency_penalty,
+        repeat_penalty=req.repeat_penalty,
+        min_p=req.min_p,
     )
 
 

@@ -22,12 +22,19 @@ class SamplingParams:
     top_p: float = 1.0
     ignore_eos: bool = False
     max_tokens: int = 1024
-    # Presence penalty (OpenAI semantics): subtract `presence_penalty` from the logit of
-    # every token already generated in the sequence (one hit per distinct token), applied
-    # before temperature/softmax/top-k/top-p. 0.0 disables. Frequency penalty fields are
-    # parsed by the API but presence is the only one wired into the sampler so far.
+    # Logit-space penalties (OpenAI/llama.cpp semantics), applied to raw logits before
+    # temperature/softmax/top-k/top-p, over the whole seen sequence (prompt + generated):
+    #   presence:  logits -= presence_penalty      for every *distinct* seen token
+    #   frequency: logits -= frequency_penalty * N for each seen token (N = occurrence count)
+    #   repeat:    logits /= repeat_penalty if >0, else *= repeat_penalty, per distinct token
+    # 0.0 disables presence/frequency; 1.0 disables repeat (multiplicative).
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    repeat_penalty: float = 1.0
+    # Minimum-p filter (probability domain): after temperature/softmax, drop any token whose
+    # probability is below `min_p * row_max_probability` (renormalizing over the kept set).
+    # Applied before top-k/top-p. 0.0 disables.
+    min_p: float = 0.0
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)

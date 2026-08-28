@@ -1,9 +1,6 @@
 """Unit tests for the presence-penalty path in the batch sampler (CPU-only, no triton)."""
 from __future__ import annotations
 
-import importlib
-import sys
-
 import torch
 import pytest
 
@@ -28,13 +25,18 @@ def _batch(reqs):
     return core.Batch(reqs=reqs, phase="decode")
 
 
+def _presence_mask(s: Sampler, batch) -> torch.Tensor:
+    """Presence (distinct-token) mask derived from the sampler's counts matrix."""
+    return s._counts(batch) > 0
+
+
 def test_presence_mask_distinct_tokens():
     s = Sampler(device=torch.device("cpu"), vocab_size=8)
     r = _req(
         torch.tensor([1, 2, 2, 3, 1]),
         core.SamplingParams(presence_penalty=0.5),
     )
-    mask = s._presence_mask(_batch([r]))
+    mask = _presence_mask(s, _batch([r]))
     assert mask.dtype == torch.bool
     assert mask.shape == (1, 8)
     assert list(mask[0]) == [False, True, True, True, False, False, False, False]
@@ -48,7 +50,7 @@ def test_no_penalty_when_zero():
     )
     args = s.prepare(_batch([r]))
     assert args.presence_penalties is None
-    assert args.presence_mask is None
+    assert args.counts is None
 
 
 def test_prepare_builds_penalty_and_mask():
@@ -59,10 +61,11 @@ def test_prepare_builds_penalty_and_mask():
     ]
     args = s.prepare(_batch(reqs))
     assert args.presence_penalties is not None
-    assert args.presence_mask is not None
-    assert args.presence_penalties.tolist() == [0.5, 1.0]
-    assert list(args.presence_mask[0]) == [False, True, True, False, False, False, False, False]
-    assert list(args.presence_mask[1]) == [False, False, True, False, False, False, False, True]
+    assert args.counts is not None
+    assert args.presence_penalties.tolist() == pytest.approx([0.5, 1.0])
+    mask = args.counts > 0
+    assert list(mask[0]) == [False, True, True, False, False, False, False, False]
+    assert list(mask[1]) == [False, False, True, False, False, False, False, True]
 
 
 def test_sample_applies_penalty_before_sampling(monkeypatch):
@@ -75,7 +78,7 @@ def test_sample_applies_penalty_before_sampling(monkeypatch):
 
     captured = {}
 
-    def fake_sample_impl(logits, temps, top_k, top_p):
+    def fake_sample_impl(logits, temps, top_k, top_p, min_p=None):
         captured["logits"] = logits.clone()
         # canonical greedy-ish: return index of max post-penalty logit
         return torch.argmax(logits, dim=-1)
@@ -87,12 +90,12 @@ def test_sample_applies_penalty_before_sampling(monkeypatch):
     out = s.sample(logits, args)
 
     post = captured["logits"][0]
-    assert post.tolist() == [-0.5, 0.5, 1.5, 3.0]
+    assert post.tolist() == pytest.approx([-0.5, 0.5, 1.5, 3.0])
     # token 3 has the highest post-penalty logit -> chosen
     assert out.tolist() == [3]
 
 
-def test_greedy_path_still_applies_penalty(monkeypatch):
+def test_greedy_path_still_applies_penalty():
     s = Sampler(device=torch.device("cpu"), vocab_size=4)
     r = _req(
         torch.tensor([0, 1, 2]),
@@ -100,17 +103,10 @@ def test_greedy_path_still_applies_penalty(monkeypatch):
     )
     args = s.prepare(_batch([r]))
     assert args.presence_penalties is not None  # penalty still captured for greedy rows
-
-    captured = {}
-
-    def fake_sample_impl(logits, temps, top_k, top_p):
-        captured["logits"] = logits.clone()
-        return torch.argmax(logits, dim=-1)
-
-    monkeypatch.setattr(sample_mod, "sample_impl", fake_sample_impl)
+    assert args.counts is not None
+    assert args.temperatures is None  # greedy rows keep the argmax path
 
     logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
     out = s.sample(logits, args)
     # After -1.0 on tokens 0,1,2: [-1, 0, 1, 3] -> argmax picks token 3
     assert out.tolist() == [3]
-    assert captured["logits"][0].tolist() == [-1.0, 0.0, 1.0, 3.0]

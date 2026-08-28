@@ -17,9 +17,20 @@ _PYROOT = os.path.join(os.path.dirname(__file__), "..", "python")
 _SERVER = os.path.join(_PYROOT, "freetoken", "server")
 
 
+_SNIPPED = [
+    "freetoken",
+    "freetoken.server",
+    "freetoken.server.api_models",
+    "freetoken.server.reasoning_parser",
+    "freetoken.server.function_call_parser",
+]
+
+
 def _leaf_module(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
+    if name not in _SNIPPED:
+        _SNIPPED.append(name)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
@@ -30,10 +41,6 @@ def _load_without_torch():
     root.__path__ = [os.path.join(_PYROOT, "freetoken")]
     root.__package__ = "freetoken"
     sys.modules["freetoken"] = root
-    pkg = types.ModuleType("freetoken.core")
-    pkg.__path__ = [os.path.join(_PYROOT, "freetoken", "core")]
-    pkg.__package__ = "freetoken.core"
-    sys.modules["freetoken.core"] = pkg
     apim = _leaf_module("freetoken.server.api_models",
                         os.path.join(_SERVER, "api_models.py"))
     _leaf_module("freetoken.server.reasoning_parser",
@@ -44,6 +51,18 @@ def _load_without_torch():
 
 
 _AM, _FCP = _load_without_torch()
+
+# Un-stub sys.modules so these test modules don't shadow the real freetoken packages for
+# other test files collected in the same pytest process. The stub objects we need are
+# already bound to module-level names, so restoring is safe here.
+_names = {}
+for _n in _SNIPPED:
+    _names[_n] = sys.modules.pop(_n, None)
+for _n, _m in _names.items():
+    if _m is not None:
+        sys.modules[_n] = _m
+del _names
+
 Tool = _AM.Tool
 Function = _AM.Function
 FunctionCallParser = _FCP.FunctionCallParser

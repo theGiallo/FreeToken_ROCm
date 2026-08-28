@@ -7,17 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **`presence_penalty` is now actually applied** (was parsed-but-ignored no-op) for
-  OpenAI/chat completions. Plumbed from the wire request through
-  `SamplingParams.presence_penalty` (`core.py`) and `resolve_sampling`
-  (`generation.py` / `openai_api.py`) into the batch sampler
-  (`engine/sample.py`): `Sampler.prepare` builds a per-row boolean presence mask
-  (one hit per *distinct* token already generated, from each request's sequence)
-  and `Sampler.sample` subtracts the penalty from those logits **before**
-  temperature/softmax/top-k/top-p. Also honored on the greedy (argmax) path.
-  `frequency_penalty` is carried into `SamplingParams` for parity but is still a
-  no-op; `min_p` likewise remains accepted-but-unapplied. Unit-tested in
-  `tests/engine/test_presence_penalty.py`.
+- **`presence_penalty`, `frequency_penalty`, `repeat_penalty` and `min_p` are now
+  actually applied** (previously parsed-but-ignored / no-op). Plumbed from the wire request
+  through `SamplingParams` (`core.py`) and `resolve_sampling` (`generation.py` /
+  `openai_api.py`) into the batch sampler (`engine/sample.py`):
+  - **Logit penalties** (`Sampler.prepare` builds a per-row occurrence-count matrix
+    `counts[B,V]` from each request's full seen sequence; `Sampler.sample` applies them
+    before temperature/softmax/top-k/top-p): presence `-= pp` per *distinct* token,
+    frequency `-= fp * count` per occurrence, repeat `/= rr` (or `*=` for negative logits)
+    per distinct token. Honored on the greedy (argmax) path, which now also correctly
+    keeps `temperatures=None` so penalized-greedy still argmaxes.
+  - **`min_p`** is a probability-domain filter applied in `sample_impl` right after
+    softmax (`_apply_min_p`): tokens with prob `< min_p * row_max` are zeroed so the draw
+    cannot pick them; skipped on greedy.
+  - `min_p` / `repeat_penalty` default from the checkpoint's sampling config when present
+    (`utils/hf.py` `load_generation_sampling` reads `general.sampling.min_p` /
+    `general.sampling.repeat_penalty`), and are accepted as explicit OpenAI request fields
+    (`api_models.py`) so pi's `models.json` `min_p`/`repeat_penalty` keys flow through.
+  - Unit-tested in `tests/engine/test_sampling_penalties.py` and `tests/engine/test_presence_penalty.py`.
 
 ### Qwen3.6-35B-A3B tool-call parsing (drift dialects)
 

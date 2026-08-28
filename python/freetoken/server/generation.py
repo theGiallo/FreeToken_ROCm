@@ -166,6 +166,8 @@ def resolve_sampling(
     stop: str | list[str] | None = None,
     presence_penalty: float | None = None,
     frequency_penalty: float | None = None,
+    repeat_penalty: float | None = None,
+    min_p: float | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -189,6 +191,8 @@ def resolve_sampling(
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         presence_penalty=presence_penalty if presence_penalty is not None else 0.0,
         frequency_penalty=frequency_penalty if frequency_penalty is not None else 0.0,
+        repeat_penalty=pick(repeat_penalty, "repeat_penalty", 1.0),
+        min_p=pick(min_p, "min_p", 0.0),
     )
 
 
