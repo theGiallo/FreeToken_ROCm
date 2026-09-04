@@ -202,6 +202,51 @@ class Qwen35DriftTest(unittest.TestCase):
         twice = det._normalize_qwen35_drift(once, TOOLS)
         self.assertEqual(once, twice)
 
+    def test_call_tool_wrapper_parses_without_leaking_markup(self):
+        # The duck_hunt model emitted <call_tool> (not <tool_call>). It must
+        # parse into a call AND not leak the raw XML as normal_text.
+        text = ("Let me check the file.\n\n"
+                "<call_tool>\n"
+                " <function=read>\n"
+                " <parameter=limit>\n 25\n </parameter>\n"
+                " <parameter=offset>\n 805\n </parameter>\n"
+                " <parameter=path>\n /workspace/duck_hunt/duck_hunt.py\n </parameter>\n"
+                " </function>\n"
+                "</call_tool>")
+        normal, calls = parse_one(text)
+        self.assertEqual(normal, "Let me check the file.")
+        self.assertEqual([c[0] for c in calls], ["read"])
+        self.assertNotIn("call_tool", normal)
+        self.assertNotIn("<function", normal)
+
+    def test_call_tool_wrapper_bash_parses_and_strips(self):
+        text = ("I'll check the package.\n\n"
+                "<call_tool>\n"
+                " <function=bash>\n"
+                " <parameter=command>\n pip show windows-curses\n </parameter>\n"
+                " </function>\n"
+                "</call_tool>")
+        normal, calls = parse_one(text)
+        self.assertEqual(normal, "I'll check the package.")
+        self.assertEqual(calls, [("bash", '{"command": " pip show windows-curses\\n "}')])
+        self.assertNotIn("call_tool", normal)
+        self.assertNotIn("<function", normal)
+
+    def test_has_tool_call_recognizes_call_tool(self):
+        det = Qwen3CoderDetector()
+        self.assertTrue(det.has_tool_call("<call_tool>"))
+        self.assertTrue(det.has_tool_call("<call_tool>\n<function=read>\n</call_tool>"))
+
+    def test_call_tool_streaming_parses(self):
+        text = ("Let me read it.\n\n<call_tool>\n<function=read>\n"
+                "<parameter=path>\n/workspace/duck_hunt/duck_hunt.py\n</parameter>\n"
+                "</function>\n</call_tool>")
+        det = Qwen3CoderDetector()
+        res = det.parse_streaming_increment(text, TOOLS)
+        finish = det.finish_streaming()
+        self.assertEqual((res.normal_text + finish).strip(), "Let me read it.")
+        self.assertTrue(res.calls or det._buffer == "")
+
     def test_generation_gate_scenario(self):
         # What the sweep measured: drift content with finish_reason=stop.
         for s in (

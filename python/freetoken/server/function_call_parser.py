@@ -1940,7 +1940,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         self._ps_reset()
 
     def has_tool_call(self, text: str) -> bool:
-        if "<function=" in text or self.bot_token in text or "<parameter=" in text:
+        if "<function=" in text or self.bot_token in text or "<parameter=" in text or "<call_tool>" in text:
             return True
         # Drift dialects: a bare tool-name tag (``<bash>``) directly or on the next
         # line opening a nested parameter structure.  Conservative: this only routes
@@ -2080,8 +2080,15 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
         return json.dumps(param_dict, ensure_ascii=False)
 
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        if "<call_tool>" in new_text and self.bot_token not in self._buffer and self._ps_mode == "idle":
+            new_text = new_text.replace("<call_tool>", self.bot_token, 1).replace("</call_tool>", self.eot_token, 1)
+        return super().parse_streaming_increment(new_text, tools)
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         text = self._normalize_qwen35_drift(text, tools)
+        if "<call_tool>" in text and self.bot_token not in text:
+            text = text.replace("<call_tool>", self.bot_token, 1).replace("</call_tool>", self.eot_token, 1)
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
 
