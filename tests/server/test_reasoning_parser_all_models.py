@@ -116,6 +116,52 @@ def test_think_no_reasoning_passthrough(name):
     assert content == "just an answer"
 
 
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+def test_think_tool_call_after_close_routes_to_content(name):
+    # Malformed Qwen stream: the closing  response is emitted but the tool-CSL
+    # <tool_call> block stays in the reasoning channel. The tool_start_token
+    # fallback must cut reasoning at <tool_call> and keep the block in content so
+    # the tool-call parser sees it (previously it leaked as raw reasoning).
+    stream = "I need to provide the content parameter.\n\n</thinking>\n\n<tool_call>\n<function=write>\n<parameter=path>\n/workspace/duck_hunt.py\n</parameter>\n</tool_call>"
+    parser = ReasoningParser(name, force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(stream)
+    assert "<tool_call>" not in reasoning and "<function=" not in reasoning
+    assert content.startswith("<tool_call>")
+    assert "<function=write>" in content
+    assert "duck_hunt.py" in content
+
+
+def test_think_streaming_tool_call_after_close_routes_to_content():
+    # Streaming variant: feed the malformed stream token-by-token so the closer and
+    # the <tool_call> are split across chunks, and the tool block must land in
+    # content (not reasoning) once the parser sees the marker.
+    chunks = [
+        "I need to provide",
+        " the content parameter.",
+        "\n\n",
+        "</thinking",
+        ">",
+        "\n\n",
+        "<tool",
+        "_call",
+        ">",
+        "\n<function=write>",
+        "\n<parameter=path>\n/workspace/duck_hunt.py\n</parameter>",
+        "\n</tool_call>",
+    ]
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning_parts, content_parts = [], []
+    for ch in chunks:
+        r, c = parser.parse_stream_chunk(ch)
+        reasoning_parts.append(r)
+        content_parts.append(c)
+    reasoning = "".join(reasoning_parts)
+    content = "".join(content_parts) + parser.flush()[1]
+    assert "<tool_call>" in content and "<function=write>" in content
+    assert "<tool_call>" not in reasoning and "<function=" not in reasoning
+    assert reasoning.startswith("I need to provide")
+
+
 # ----------------------------------------------------------------------- gemma
 def test_gemma_thought_split():
     parser = ReasoningParser("gemma4", force_reasoning=True)

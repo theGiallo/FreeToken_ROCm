@@ -392,15 +392,15 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
 
 
 class ThinkReasoningParser(BaseReasoningParser):
-    """Generic ``<think>``/``</think>`` reasoning parser for models that wrap their
-    chain-of-thought in think tags (Qwen3/3.5, GLM-4.x, MiniMax-M2). No DSML tool
-    marker — reasoning ends at ``</think>``.
+    """Generic `` thinking``/`` response`` reasoning parser for models that wrap their
+    chain-of-thought in think tags (Qwen3/3.5, GLM-4.x, MiniMax-M2). Reasoning ends
+    at `` response``, or at the first Qwen tool-CSL ``<tool_call>`` marker when a
+    (malformed) turn skips `` response`` and runs straight into a tool call.
 
-    Assumes the model closes ``</think>`` before any tool call. These families do
-    so in well-formed thinking mode; unlike dsv4 there is no ``tool_start_token``
-    fallback, so a (malformed) turn that skips ``</think>`` and runs straight into
-    a tool call would fold that block into reasoning. Add a family-appropriate
-    ``tool_start_token`` (as ``DeepSeekV32ReasoningParser`` does) if that surfaces.
+    The ``tool_start_token`` mirrors the DeepSeek-V3.2 / MiniMax-M3 fallback so the
+    tool block is routed to the tool-call parser instead of folding into reasoning
+    (which would surface the raw ``<tool_call>``/``<function=`` markup as leaked
+    reasoning in the client chat).
     """
 
     def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
@@ -409,6 +409,7 @@ class ThinkReasoningParser(BaseReasoningParser):
             think_end_token=THINK_END_TOKEN,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
         )
 
 
