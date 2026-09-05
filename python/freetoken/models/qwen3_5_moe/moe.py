@@ -80,7 +80,7 @@ class Qwen3_5MoE(BaseOP):
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
-            renormalize=True,
+renormalize=config.norm_topk_prob,
             weight_format=weight_format,
             extra_attrs=extra_attrs,
         )
