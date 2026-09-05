@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import itertools
 import json
 import math
 import os
@@ -28,7 +29,6 @@ WINDOW = 60  # seconds for moving average
 VRAM_NULL_THRESHOLD = 128 * 1024**2  # 128 MB — below this a zero-tok/s sample is idle
 PLOT_HISTORY = 120  # plotted points kept in the live terminal plot
 PLOT_MAX_RAW = 720  # raw samples retained for the live plot (~12 min at 1 Hz)
-SCROLL_WINDOW = 120  # seconds wide scrolling window in the live terminal plot
 
 API = os.environ.get("FT_STATS_URL", "http://127.0.0.1:1919/v1/stats")
 POLL_INTERVAL = 1.0
@@ -161,19 +161,6 @@ def _term_size():
         return collections.namedtuple("size", "columns lines")(100, 30)
 
 
-def _collapse_zeros(pts):
-    """Keep one point per consecutive run of zeros so idle gaps don't flatten the plot."""
-    out = []
-    prev_zero = False
-    for t, v in pts:
-        z = v == 0
-        if z and prev_zero:
-            continue
-        out.append((t, v))
-        prev_zero = z
-    return out[-PLOT_HISTORY:]
-
-
 def _sparkline(vals, columns):
     if not vals:
         return ""
@@ -241,23 +228,21 @@ def _plot_lines(hist, plot_h):
     except ImportError:
         plotext = None
 
-    t, dt, pt, vram, ram = zip(*hist)
-    # Crop to the scrolling window before collapsing so the x-axis keeps advancing
-    # even when values are steady. Cropping here (instead of forcing xlim on the
-    # plotext ruler) keeps every panel on the same range AND avoids a plotext 6
-    # kernel assert that fires when a collapsed series (e.g. a long idle tail) has
-    # single/few points inside a wide forced limit window.
-    tmin = max(t[0], t[-1] - SCROLL_WINDOW)
-
-    def build(col):
-        pts = [(a, b) for a, b in zip(t, col) if a >= tmin - POLL_INTERVAL]
-        return _collapse_zeros(pts)
-
+    # Live plot is a sliding window over the last PLOT_HISTORY raw samples, x = the
+    # sample's position within the window. Index-based x (not wall-clock) makes the
+    # plot scroll one column per fetched sample even when the server answers
+    # sparsely, so a steady value draws as a flat line forming on the right edge
+    # while older samples move out on the left. Every panel shares the same window,
+    # so the x axes stay aligned without forcing xlim (which crashes plotext 6 when
+    # a series collapses to a single point inside a wide window).
+    win = list(itertools.islice(hist, max(0, len(hist) - PLOT_HISTORY), None))
+    _, dt, pt, vram, ram = zip(*win)
+    idx = list(range(len(win)))
     series = {
-        "decode": build(dt),
-        "prefill": build(pt),
-        "vram": build(vram),
-        "ram": build(ram),
+        "decode": list(zip(idx, dt)),
+        "prefill": list(zip(idx, pt)),
+        "vram": list(zip(idx, vram)),
+        "ram": list(zip(idx, ram)),
     }
 
     if plotext is not None and plot_h >= 15:
@@ -315,7 +300,9 @@ def poll(args):
                     window.append((dt, pt, vram, ram))
                     plot_hist.append((time.monotonic() - t0, dt, pt, vram, ram))
                     if is_zero and last10:
-                        last10[-1] = (seen, last10[-1][1], last10[-1][2], last10[-1][3], last10[-1][4])
+                        # Slide the index forward but keep the idle sample's real values,
+                        # so the row doesn't report the last prefill burst as current.
+                        last10[-1] = (seen, dt, pt, vram, ram)
                     else:
                         last10.append((seen, dt, pt, vram, ram))
 
@@ -365,7 +352,7 @@ def poll(args):
                     if show_last10:
                         lines.append(
                             f"  {'#':>5}  {'Decode':>7}  {'Prefill':>7}  "
-                            f"{'VRAM':>6}  {'RAM':>6}"
+                            f"{'VRAM':>6}  {'RAM avail':>10}"
                         )
                         lines.append(f"  {'─'*45}")
                         for row_n, rdt, rpt, rvram, rram in last10:
@@ -378,33 +365,33 @@ def poll(args):
                     mn_dt, mean_dt, trim_dt, med_dt, std_dt, mx_dt = s_dt
                     mn_pt, mean_pt, trim_pt, med_pt, std_pt, mx_pt = s_pt
                     lines.append(
-                        f"  {'AVG':<7}{mean_dt:7.1f}t  {mean_pt:7.0f}t  {'':>6}  {'':>6}"
+                        f"  {'AVG':<7}{mean_dt:7.1f}t  {mean_pt:7.0f}t  {'':>6}  {'':>10}"
                     )
                     lines.append(
-                        f"  {'TRIM':<7}{trim_dt:7.1f}t  {trim_pt:7.0f}t  {'':>6}  {'':>6}"
+                        f"  {'TRIM':<7}{trim_dt:7.1f}t  {trim_pt:7.0f}t  {'':>6}  {'':>10}"
                     )
                     lines.append(
-                        f"  {'':7}±{std_dt:6.1f}   ±{std_pt:6.0f}   {'':>6}  {'':>6}"
+                        f"  {'':7}±{std_dt:6.1f}   ±{std_pt:6.0f}   {'':>6}  {'':>10}"
                     )
                     lines.append(
                         f"  {'':7}[{mn_dt:.1f},{mx_dt:.1f}]"
                         f"  [{mn_pt:.0f},{mx_pt:.0f}]"
-                        f"  {'':>6}  {'':>6}"
+                        f"  {'':>6}  {'':>10}"
                     )
                     lines.append(
-                        f"  {'MED':<7}{med_dt:7.1f}t  {med_pt:7.0f}t  {'':>6}  {'':>6}"
+                        f"  {'MED':<7}{med_dt:7.1f}t  {med_pt:7.0f}t  {'':>6}  {'':>10}"
                     )
                     lines.append(
                         f"  {'WIN':<7}{w_dt:7.1f}t  {w_pt:7.0f}t  "
-                        f"{w_vram:6.1f}G  {w_ram:6.1f}G"
+                        f"{w_vram:6.1f}G  {w_ram:7.1f}G"
                     )
                     lines.append(
                         f"  {'WINMED':<7}{wm_dt:7.1f}t  {wm_pt:7.0f}t  "
-                        f"{wm_vram:6.1f}G  {wm_ram:6.1f}G"
+                        f"{wm_vram:6.1f}G  {wm_ram:7.1f}G"
                     )
                     lines.append(
                         f"  {'EMA':<7}{ema['decode']:7.1f}t  {ema['prefill']:7.0f}t  "
-                        f"{ema['vram']:6.1f}G  {ema['ram']:6.1f}G"
+                        f"{ema['vram']:6.1f}G  {ema['ram']:7.1f}G"
                     )
 
                     print("\033[2J\033[H" + "\n".join(lines), flush=True)
