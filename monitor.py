@@ -28,6 +28,7 @@ WINDOW = 60  # seconds for moving average
 VRAM_NULL_THRESHOLD = 128 * 1024**2  # 128 MB — below this a zero-tok/s sample is idle
 PLOT_HISTORY = 120  # plotted points kept in the live terminal plot
 PLOT_MAX_RAW = 720  # raw samples retained for the live plot (~12 min at 1 Hz)
+SCROLL_WINDOW = 120  # seconds wide scrolling window in the live terminal plot
 
 API = os.environ.get("FT_STATS_URL", "http://127.0.0.1:1919/v1/stats")
 POLL_INTERVAL = 1.0
@@ -56,12 +57,43 @@ def fetch_stats() -> dict | None:
 
 
 def read_ram() -> int:
+    if sys.platform.startswith("win"):
+        return _read_ram_windows()
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024  # kB → bytes
     except OSError:
+        pass
+    return 0
+
+
+def _read_ram_windows() -> int:
+    """Available physical RAM (bytes) via GlobalMemoryStatusEx."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        co = ctypes.windll.kernel32.GlobalMemoryStatusEx
+        if co(ctypes.byref(stat)):
+            return int(stat.ullAvailPhys)
+    except Exception:
         pass
     return 0
 
@@ -163,14 +195,10 @@ def _plot_lines_plotext(series, width, height):
 
     fig = plt.figure
 
-    all_x = [p[0] for s in series.values() for p in s] or [0.0]
-    xmin, xmax = min(all_x), max(all_x)
-
     def panel(pairs):
         fig.clear()
         fig.theme("colorless")
         fig.plot_size(width, height)
-        fig.ruler("x").lim(xmin, xmax)
         for name, pts in pairs:
             xs = [p[0] for p in pts] or [0.0]
             ys = [p[1] for p in pts] or [0.0]
@@ -214,11 +242,22 @@ def _plot_lines(hist, plot_h):
         plotext = None
 
     t, dt, pt, vram, ram = zip(*hist)
+    # Crop to the scrolling window before collapsing so the x-axis keeps advancing
+    # even when values are steady. Cropping here (instead of forcing xlim on the
+    # plotext ruler) keeps every panel on the same range AND avoids a plotext 6
+    # kernel assert that fires when a collapsed series (e.g. a long idle tail) has
+    # single/few points inside a wide forced limit window.
+    tmin = max(t[0], t[-1] - SCROLL_WINDOW)
+
+    def build(col):
+        pts = [(a, b) for a, b in zip(t, col) if a >= tmin - POLL_INTERVAL]
+        return _collapse_zeros(pts)
+
     series = {
-        "decode": _collapse_zeros(list(zip(t, dt))),
-        "prefill": _collapse_zeros(list(zip(t, pt))),
-        "vram": _collapse_zeros(list(zip(t, vram))),
-        "ram": _collapse_zeros(list(zip(t, ram))),
+        "decode": build(dt),
+        "prefill": build(pt),
+        "vram": build(vram),
+        "ram": build(ram),
     }
 
     if plotext is not None and plot_h >= 15:
