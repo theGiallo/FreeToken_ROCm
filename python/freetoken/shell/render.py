@@ -154,7 +154,7 @@ class ShellConsoleRenderer:
 
     The split is the server's: ``/v1/chat/completions`` emits ``delta.reasoning_content`` and
     ``delta.content`` on separate channels (one reasoning parser for every model family --
-    gpt-oss Harmony, ``<think>`` for Qwen3/GLM/MiniMax, Gemma's thought channel), so a client
+    gpt-oss Harmony, ``<thinking>`` for Qwen3/GLM/MiniMax, Gemma's thought channel), so a client
     only has to route them. A model with no reasoning parser configured simply never produces
     the reasoning channel and every delta prints as plain output.
     """

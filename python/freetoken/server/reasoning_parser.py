@@ -1,17 +1,17 @@
 """Reasoning-content parsing for OpenAI-compatible responses.
 
-Separates a model completion into ``reasoning_content`` (the ``<think>…</think>``
+Separates a model completion into ``reasoning_content`` (the ``<thinking>…</thinking>``
 block) and ``content`` (everything else), running *before* the tool-call parser
 just like SGLang's ``serving_chat`` does. Adapted from SGLang's
 ``python/sglang/srt/parser/reasoning_parser.py`` and trimmed to what FreeToken's
 text-only edge models need.
 
-DeepSeek-V4 / V3.2 inject the opening ``<think>`` at the generation prompt, so
+DeepSeek-V4 / V3.2 inject the opening ``<thinking>`` at the generation prompt, so
 the model output *starts inside* the reasoning block and only ever emits the
-closing ``</think>`` (see ``tokenizer/tokenize.py``). When
+closing ``</thinking>`` (see ``tokenizer/tokenize.py``). When
 thinking is active the caller must construct the parser with
 ``force_reasoning=True`` so the leading text is attributed to reasoning. The
-model also sometimes skips ``</think>`` and jumps straight to the ``｜DSML｜``
+model also sometimes skips ``</thinking>`` and jumps straight to the ``｜DSML｜``
 tool block; ``tool_start_token`` ends reasoning at the first DSML marker and
 preserves the block for the tool-call parser.
 """
@@ -25,12 +25,19 @@ from typing import Dict, List, Optional, Tuple, Type
 # DeepSeek-V4 / V3.2 protocol special-token strings. The detokenizer decodes with
 # skip_special_tokens=False (so the DSML tool markers survive for the tool parser),
 # which means BOS/EOS and the think tags can leak into the text. The reasoning and
-# tool parsers strip <think>/</think> and the DSML block themselves; this set is the
+# tool parsers strip <thinking>/</thinking> and the DSML block themselves; this set is the
 # residual cleanup applied to the final content / reasoning fields.
 BOS_TOKEN = "<｜begin▁of▁sentence｜>"
 EOS_TOKEN = "<｜end▁of▁sentence｜>"
-THINK_START_TOKEN = "<think>"
-THINK_END_TOKEN = "</think>"
+THINK_START_TOKEN = "<thinking>"
+THINK_END_TOKEN = "</thinking>"
+
+# Qwen3.6 wraps a stray "thought" section in this alias pair in addition to
+# the <thinking> protocol block. Consumers recognize only <thinking>, so the
+# alias must be routed to reasoning_content here or it leaks as raw markup in
+# the visible answer.
+THOUGHT_START_TOKEN = "<thought>"
+THOUGHT_END_TOKEN = "</thought>"
 DSML_TOKEN = "｜DSML｜"
 
 DSV4_SPECIAL_TOKENS: List[str] = [
@@ -91,8 +98,8 @@ class BaseReasoningParser:
     """One-shot and streaming reasoning extraction.
 
     Args:
-        think_start_token: Opening reasoning marker (e.g. ``<think>``).
-        think_end_token: Closing reasoning marker (e.g. ``</think>``).
+        think_start_token: Opening reasoning marker (e.g. ``<thinking>``).
+        think_end_token: Closing reasoning marker (e.g. ``</thinking>``).
         force_reasoning: If True, the completion is assumed to *start* inside a
             reasoning block even when no opening marker is emitted (the dsv4
             implicit-open convention).
@@ -100,10 +107,14 @@ class BaseReasoningParser:
             it is buffered until the closing marker.
         tool_start_token: Optional marker that ends reasoning without a closing
             ``think_end_token`` (the block is preserved in ``normal_text``).
+        alt_start_token: Optional opening marker that opens the same reasoning
+            block as ``think_start_token`` (e.g. the Qwen3.6 ``<thought>`` alias).
+        alt_end_token: Optional closer paired with ``alt_start_token``; the first
+            closer of either flavour ends reasoning.
     """
 
     # Max bytes a suspected tool block is held while waiting for a possible later
-    # </think> that would reclaim it as reasoning. Short quoted markers stay
+    # </thinking> that would reclaim it as reasoning. Short quoted markers stay
     # recoverable; anything longer commits to "real tool call" and streams live.
     TOOL_HOLD_MAX = 512
 
@@ -114,43 +125,96 @@ class BaseReasoningParser:
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
         tool_start_token: Optional[str] = None,
+        alt_start_token: Optional[str] = None,
+        alt_end_token: Optional[str] = None,
     ) -> None:
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self.tool_start_token = tool_start_token
+        self.alt_start_token = alt_start_token
+        self.alt_end_token = alt_end_token
         self.force_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
         self._in_reasoning = force_reasoning
         self._buffer = ""
-        self._stripped_think_start = False
+        # Once a closer has ended reasoning, a later primary opener in content is
+        # data (minimax anchor-first convention); only the alias opener reopens.
+        self._reasoning_closed = False
+
+    @property
+    def _openers(self) -> List[str]:
+        return [t for t in (self.think_start_token, self.alt_start_token) if t]
+
+    @property
+    def _closers(self) -> List[str]:
+        return [t for t in (self.think_end_token, self.alt_end_token) if t]
+
+    @staticmethod
+    def _first_marker(text: str, tokens: List[str]) -> Optional[Tuple[int, str]]:
+        """Earliest ``(index, token)`` in ``text`` among ``tokens``, else None."""
+        best: Optional[Tuple[int, str]] = None
+        for tok in tokens:
+            idx = text.find(tok)
+            if idx != -1 and (best is None or idx < best[0]):
+                best = (idx, tok)
+        return best
+
+    @staticmethod
+    def _strip_all(text: str, tokens: List[str]) -> str:
+        for tok in tokens:
+            text = text.replace(tok, "")
+        return text
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
-        """One-shot parse of a complete completion."""
-        in_reasoning = self._in_reasoning or self.think_start_token in text
-        if not in_reasoning:
-            return ReasoningParseResult(normal_text=text)
+        """One-shot parse of a complete completion.
 
-        processed_text = text.replace(self.think_start_token, "").strip()
-
-        if self.think_end_token not in processed_text:
-            # No closing </think>. If a tool block starts, reasoning ends there
-            # and the block stays in normal_text for the tool-call parser.
-            if (
-                self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
-                tool_idx = processed_text.find(self.tool_start_token)
-                return ReasoningParseResult(
-                    reasoning_text=processed_text[:tool_idx].strip(),
-                    normal_text=processed_text[tool_idx:],
-                )
-            # Otherwise reasoning was truncated before the end marker.
-            return ReasoningParseResult(reasoning_text=processed_text)
-
-        reasoning_text, normal_text = processed_text.split(self.think_end_token, 1)
+        Both marker pairs open and close the same block: an opener of either
+        flavour starts reasoning, the first later closer of either flavour ends
+        it. A stray closer in content is dropped, and an opener appearing inside
+        an open region is noise (see _strip_all). A region closed mid-text
+        re-parses the remainder, so a trailing alias block after a closed primary
+        region still lands in reasoning.
+        """
+        current = text
+        in_reasoning = self._in_reasoning
+        reasoning: List[str] = []
+        content: List[str] = []
+        for _ in range(4):
+            if in_reasoning:
+                hit = self._first_marker(current, self._closers)
+                if hit is not None:
+                    idx, marker = hit
+                    reasoning.append(
+                        self._strip_all(current[:idx], self._openers).rstrip()
+                    )
+                    current = current[idx + len(marker):]
+                    in_reasoning = False
+                    continue
+                # No closer: a tool block ends reasoning there, or the block is
+                # truncated before the end marker.
+                current = self._strip_all(current, self._openers)
+                if (
+                    self.tool_start_token is not None
+                    and self.tool_start_token in current
+                ):
+                    tool_idx = current.find(self.tool_start_token)
+                    reasoning.append(current[:tool_idx].rstrip())
+                    content.append(current[tool_idx:])
+                else:
+                    reasoning.append(current.rstrip())
+                break
+            hit = self._first_marker(current, self._openers)
+            if hit is None:
+                content.append(self._strip_all(current, self._closers))
+                break
+            idx, marker = hit
+            content.append(current[:idx])
+            current = current[idx + len(marker):]
+            in_reasoning = True
         return ReasoningParseResult(
-            reasoning_text=reasoning_text, normal_text=normal_text.strip()
+            reasoning_text="".join(reasoning).strip(),
+            normal_text="".join(content).strip(),
         )
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
@@ -158,70 +222,99 @@ class BaseReasoningParser:
 
         Chunks are detokenizer deltas (roughly token-aligned). A marker's leading
         ``<`` may arrive glued to preceding text in one token (e.g. ``.<`` before
-        ``｜DSML｜tool_calls>``), so we hold back any trailing *partial* of a
-        tracked token (see ``_split_trailing_partial``) and reassemble it on the
-        next chunk rather than streaming it out and losing the marker boundary.
+        ``<tool_call>``), so we hold back any trailing *partial* of a tracked
+        token (see ``_split_trailing_partial``) and reassemble it on the next
+        chunk rather than streaming it out and losing the marker boundary.
+
+        Both marker pairs close the same reasoning block. A closed region's
+        remainder re-parses in the same chunk, so a trailing alias block after
+        ``</thinking>`` is routed to reasoning instead of leaking into content.
         """
         self._buffer += new_text
-        current_text = self._buffer
+        current = self._buffer
+        reasoning_parts: List[str] = []
+        content_parts: List[str] = []
 
-        # Strip an explicit opening <think> if a complete one is present.
-        if not self._stripped_think_start and self.think_start_token in current_text:
-            current_text = current_text.replace(self.think_start_token, "", 1)
-            self._stripped_think_start = True
+        for _ in range(4):
+            if self._in_reasoning:
+                # A complete closer of either flavour ends reasoning. Checked
+                # BEFORE the tool marker so a quoted tool block inside reasoning
+                # is reclaimed when the closer finally arrives.
+                hit = self._first_marker(current, self._closers)
+                if hit is not None:
+                    idx, marker = hit
+                    reasoning_parts.append(
+                        self._strip_all(current[:idx], self._openers).rstrip()
+                    )
+                    current = current[idx + len(marker):]
+                    self._in_reasoning = False
+                    self._reasoning_closed = True
+                    continue
+                # A complete tool marker => the model skipped the closer. HOLD
+                # from the marker and stream the reasoning before it; a later
+                # closer reclaims it as reasoning, else flush() emits the held
+                # block as content for the tool-call parser. The hold is BOUNDED:
+                # past TOOL_HOLD_MAX the block is almost certainly a real tool
+                # call and is committed live instead of held forever.
+                if self.tool_start_token and self.tool_start_token in current:
+                    tool_idx = current.find(self.tool_start_token)
+                    held = current[tool_idx:]
+                    if len(held) > self.TOOL_HOLD_MAX:
+                        reasoning_parts.append(
+                            self._strip_all(current[:tool_idx], self._openers)
+                        )
+                        content_parts.append(held)
+                        current = ""
+                        self._in_reasoning = False
+                        continue
+                    self._buffer = held
+                    return ReasoningParseResult(
+                        reasoning_text="".join(reasoning_parts)
+                        + self._strip_all(current[:tool_idx], self._openers),
+                        normal_text="".join(content_parts),
+                    )
+                # No structural event yet: strip nested openers as noise.
+                current = self._strip_all(current, self._openers)
+                break
+
+            # Content side: the first opener of the stream, or the alias opener after a
+            # close, re-enters reasoning; a late primary opener is data.
+            hit = self._first_marker(current, self._openers)
+            if hit is None:
+                break
+            idx, marker = hit
+            if self._reasoning_closed and marker != self.alt_start_token:
+                content_parts.append(current)
+                current = ""
+                break
+            content_parts.append(current[:idx])
+            current = current[idx + len(marker):]
             self._in_reasoning = True
 
-        # A complete </think> ends reasoning and WINS over any tool marker -- this
-        # is what keeps a ｜DSML｜ literal quoted inside reasoning as reasoning.
-        if self._in_reasoning and self.think_end_token in current_text:
-            end_idx = current_text.find(self.think_end_token)
-            self._buffer = ""
-            self._in_reasoning = False
-            return ReasoningParseResult(
-                reasoning_text=current_text[:end_idx].rstrip(),
-                normal_text=current_text[end_idx + len(self.think_end_token) :],
-            )
-
-        # A complete tool marker while still reasoning => the model skipped
-        # </think>. HOLD from the marker (stream the reasoning before it) and keep
-        # buffering; a later </think> reclaims it as reasoning, else flush() emits
-        # the held block as content for the tool-call parser. The hold is BOUNDED:
-        # past TOOL_HOLD_MAX the block is almost certainly a real tool call (not a
-        # quoted marker inside reasoning), so commit "reasoning ended here" and
-        # release it live — otherwise a long tool call streams nothing until
-        # end-of-generation and trips client idle timeouts (codex: 300s).
-        if self._in_reasoning and self.tool_start_token and self.tool_start_token in current_text:
-            tool_idx = current_text.find(self.tool_start_token)
-            self._buffer = current_text[tool_idx:]
-            if len(self._buffer) > self.TOOL_HOLD_MAX:
-                held = self._buffer
-                self._buffer = ""
-                self._in_reasoning = False
-                return ReasoningParseResult(
-                    reasoning_text=current_text[:tool_idx], normal_text=held
-                )
-            return ReasoningParseResult(reasoning_text=current_text[:tool_idx])
-
-        # No complete marker. Hold back any trailing partial of a tracked token so
-        # a marker split across chunks -- e.g. its leading '<' glued to preceding
-        # text as one token (".<", "><") -- is reassembled on the next chunk.
-        safe, held = self._split_trailing_partial(current_text)
-        self._buffer = held
+        safe, held = self._split_trailing_partial(current)
         if self._in_reasoning and not self.stream_reasoning:
-            self._buffer = current_text  # accumulate until the closing marker
-            return ReasoningParseResult()
+            self._buffer = current  # accumulate until the closing marker
+            return ReasoningParseResult(
+                reasoning_text="".join(reasoning_parts),
+                normal_text="".join(content_parts),
+            )
+        self._buffer = held
         if self._in_reasoning:
-            return ReasoningParseResult(reasoning_text=safe)
-        return ReasoningParseResult(normal_text=safe)
+            reasoning_parts.append(safe)
+        else:
+            content_parts.append(safe)
+        return ReasoningParseResult(
+            reasoning_text="".join(reasoning_parts),
+            normal_text="".join(content_parts),
+        )
 
-    def _split_trailing_partial(self, text: str) -> tuple[str, str]:
+    def _split_trailing_partial(self, text: str) -> Tuple[str, str]:
         """Split off the longest suffix of ``text`` that is a *proper* prefix of a
         tracked token, returning ``(safe, held)``. Lets a marker whose leading
         characters are glued to preceding text reassemble on the next chunk
         instead of being streamed out and breaking marker detection."""
-        tokens = [self.think_end_token]
-        if not self._stripped_think_start:
-            tokens.append(self.think_start_token)
+        tokens: List[str] = list(self._closers)
+        tokens.extend(self._openers)
         if self.tool_start_token:
             tokens.append(self.tool_start_token)
         best = 0
@@ -237,12 +330,13 @@ class BaseReasoningParser:
     def flush(self) -> ReasoningParseResult:
         """Drain any residue left in the buffer at end-of-stream.
 
-        A held tool block (the model skipped </think> and ran straight into the
-        ｜DSML｜ block) is attributed to content so the tool-call parser sees it;
+        A held tool block (the model skipped a closer and ran straight into a
+        tool block) is attributed to content so the tool-call parser sees it;
         any other residue is attributed by the current reasoning state (a
-        truncated </think> prefix stays reasoning; a trailing '<' of normal
-        content stays content). Without this, text stuck in the prefix buffer or
-        a held block would be silently dropped from the streamed response.
+        truncated closer prefix stays reasoning; a trailing '<' of normal
+        content stays content). A stray closer that never paired with an opener
+        is stripped from content. Without this, text stuck in the buffer or a
+        held block would be silently dropped from the streamed response.
         """
         buf = self._buffer
         self._buffer = ""
@@ -253,11 +347,10 @@ class BaseReasoningParser:
             return ReasoningParseResult(normal_text=buf)
         if self._in_reasoning:
             return ReasoningParseResult(reasoning_text=buf)
-        return ReasoningParseResult(normal_text=buf)
-
+        return ReasoningParseResult(normal_text=self._strip_all(buf, self._closers))
 
 class DeepSeekV32ReasoningParser(BaseReasoningParser):
-    """Reasoning parser for DeepSeek-V4 and DeepSeek-V3.2 (same ``<think>`` +
+    """Reasoning parser for DeepSeek-V4 and DeepSeek-V3.2 (same ``<thinking>`` +
     ``｜DSML｜`` protocol). ``force_reasoning`` defaults to True because these
     checkpoints start their output inside the reasoning block."""
 
@@ -270,7 +363,7 @@ class DeepSeekV32ReasoningParser(BaseReasoningParser):
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             # First DSML structural marker (tool_calls / function_calls / invoke)
-            # ends reasoning when </think> was skipped.
+            # ends reasoning when </thinking> was skipped.
             tool_start_token=f"<{DSML_TOKEN}",
         )
 
@@ -282,7 +375,7 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
     channel (unwrapped) to ``normal_text``. A ``commentary ... to=functions.*``
     tool-call block is preserved verbatim (markers included) in ``normal_text``
     so the downstream ``GptOssDetector`` tool parser can still extract it. All
-    three methods are overridden; the base ``<think>`` machinery is unused.
+    three methods are overridden; the base ``<thinking>`` machinery is unused.
     """
 
     def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
@@ -410,6 +503,8 @@ class ThinkReasoningParser(BaseReasoningParser):
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
+            alt_start_token=THOUGHT_START_TOKEN,
+            alt_end_token=THOUGHT_END_TOKEN,
         )
 
 
@@ -646,7 +741,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
     header that never gets its ``<|message|>`` falls to the unfinished-header
     end-of-stream rule below. This replaces a prefix-guessing "start" mode that
     kept misclassifying content shaped like a header (the same mechanism
-    ``force_reasoning`` is for the ``<think>`` families, read from the prompt
+    ``force_reasoning`` is for the ``<thinking>`` families, read from the prompt
     instead of re-derived). Text with no ATEM markers at all passes through as
     content.
 
@@ -655,7 +750,7 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
     loop on this family's long default CoT). At end-of-stream, held text is
     delivered as content rather than dropped -- a whole reply that merely looks
     like a bare-header prefix, or prose stranded after a literal closer, must
-    not vanish. All three methods are overridden; the base ``<think>`` machinery
+    not vanish. All three methods are overridden; the base ``<thinking>`` machinery
     is unused.
     """
 
@@ -922,7 +1017,7 @@ def build_reasoning_parser(config, force_reasoning: bool) -> Optional[ReasoningP
         return None
     if name == "minimax":
         # MiniMax-M2's template always starts generation inside an implicit
-        # <think> block and the model only emits the closing </think> marker.
+        # <thinking> block and the model only emits the closing </thinking> marker.
         force_reasoning = True
     return ReasoningParser(name, force_reasoning=force_reasoning)
 

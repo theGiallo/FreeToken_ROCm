@@ -25,7 +25,7 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 
 # Finish-time retention keeps [P - window - gap, P) swa-live for the next turn's cut near the
 # prompt end. The gap covers templates whose generation prompt injects tokens that vanish when
-# the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
+# the client drops reasoning (Qwen's "<thinking>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
 
 

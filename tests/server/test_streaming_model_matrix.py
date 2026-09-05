@@ -120,11 +120,11 @@ MARKUP_MARKERS = {
 # family, mirroring args.py auto-inference. think_open == "" when the chat template
 # opens the block implicitly (model emits only the closing marker).
 REASONING_FAMILIES = {
-    "dsv4": ("deepseekv32", "deepseekv32", "", "</think>"),
-    "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),
-    "qwen": ("qwen25", "qwen3", "", "</think>"),
-    "glm4.7": ("glm47", "glm", "", "</think>"),
-    "minimax-m2": ("minimax", "minimax", "", "</think>"),
+    "dsv4": ("deepseekv32", "deepseekv32", "", "</thinking>"),
+    "qwen3.5": ("qwen3_coder", "qwen3", "", "</thinking>"),
+    "qwen": ("qwen25", "qwen3", "", "</thinking>"),
+    "glm4.7": ("glm47", "glm", "", "</thinking>"),
+    "minimax-m2": ("minimax", "minimax", "", "</thinking>"),
     # M3 adaptive mode: the model opens <mm:think> itself (enabled mode pre-opens it
     # in the template; the parser then runs with force_reasoning=True instead).
     "minimax-m3": ("minimax_m3", "minimax_m3", "<mm:think>", "</mm:think>"),

@@ -23,7 +23,7 @@ class ServerArgs(SchedulerConfig):
     shell_mode: bool = False
     served_model_name: str | None = None
     tool_call_parser: str = "llama3"
-    # Reasoning parser that splits <think> reasoning from content for OpenAI
+    # Reasoning parser that splits <thinking> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
     # "model": fill unspecified request sampling params from generation_config.json
@@ -198,7 +198,7 @@ def parse_args(
         if "glm" in marker:
             return "glm"
         # M3 first ("minimax" is a substring): <mm:think> tags + 3 thinking gears,
-        # not M2's always-on implicit <think>.
+        # not M2's always-on implicit <thinking>.
         if "minimax_m3" in marker or "minimax-m3" in marker or "minimaxm3" in marker:
             return "minimax_m3"
         if "minimax" in marker:
@@ -463,7 +463,7 @@ def parse_args(
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
             "for OpenAI responses. 'auto' selects per model family (gpt-oss Harmony, "
-            "<think> for qwen3/glm/minimax, <mm:think> for minimax-m3, ATEM to=self "
+            "<thinking> for qwen3/glm/minimax, <mm:think> for minimax-m3, ATEM to=self "
             "channels for muse-glimmer, gemma thought, dsv4); 'off' disables it."
         ),
     )

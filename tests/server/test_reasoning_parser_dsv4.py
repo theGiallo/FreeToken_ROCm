@@ -1,5 +1,5 @@
 """The deepseekv32 reasoning parser (server/reasoning_parser.py), whose DSML tool-call markup
-makes it the only family that ends reasoning on something other than ``</think>``. The other
+makes it the only family that ends reasoning on something other than ``</thinking>``. The other
 families are covered in test_reasoning_parser_all_models.py."""
 from __future__ import annotations
 
@@ -42,14 +42,14 @@ def _stream(parser: ReasoningParser, chunks):
 # ----------------------------------------------------------------- non-stream
 def test_thinking_with_end_token():
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
-    reasoning, content = parser.parse_non_stream("I should answer.</think>The answer is 42.")
+    reasoning, content = parser.parse_non_stream("I should answer.</thinking>The answer is 42.")
     assert reasoning == "I should answer."
     assert content == "The answer is 42."
 
 
 def test_thinking_with_tool_block_after_end_token():
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
-    text = f"Let me check the weather.</think>Sure!\n\n{TOOL_BLOCK}"
+    text = f"Let me check the weather.</thinking>Sure!\n\n{TOOL_BLOCK}"
     reasoning, content = parser.parse_non_stream(text)
     assert reasoning == "Let me check the weather."
     # Content keeps the tool block for the function-call parser.
@@ -58,7 +58,7 @@ def test_thinking_with_tool_block_after_end_token():
 
 
 def test_missing_end_token_with_tool_block():
-    # dsv4 sometimes skips </think> and jumps straight to the DSML block.
+    # dsv4 sometimes skips </thinking> and jumps straight to the DSML block.
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
     text = f"I will call the tool.\n\n{TOOL_BLOCK}"
     reasoning, content = parser.parse_non_stream(text)
@@ -93,9 +93,9 @@ def test_truncated_reasoning_no_end_token():
 
 
 def test_explicit_think_start_in_chat_mode():
-    # Defensive: an explicit <think> turns reasoning on even when not forced.
+    # Defensive: an explicit <thinking> turns reasoning on even when not forced.
     parser = ReasoningParser("deepseekv32", force_reasoning=False)
-    reasoning, content = parser.parse_non_stream("<think>hmm</think>done")
+    reasoning, content = parser.parse_non_stream("<thinking>hmm</thinking>done")
     assert reasoning == "hmm"
     assert content == "done"
 
@@ -103,14 +103,14 @@ def test_explicit_think_start_in_chat_mode():
 # --------------------------------------------------------------------- stream
 def test_stream_thinking_with_end_token():
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
-    reasoning, content = _stream(parser, ["I should ", "answer.", "</think>", "The ", "answer."])
+    reasoning, content = _stream(parser, ["I should ", "answer.", "</thinking>", "The ", "answer."])
     assert reasoning == "I should answer."
     assert content == "The answer."
 
 
 def test_stream_end_token_split_across_chunks():
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
-    reasoning, content = _stream(parser, ["reason", "</th", "ink>", "done"])
+    reasoning, content = _stream(parser, ["reason", "</think", "ing>", "done"])
     assert reasoning == "reason"
     assert content == "done"
 
@@ -131,13 +131,13 @@ def test_stream_chat_mode_streams_content():
 
 
 def test_stream_dsml_literal_in_reasoning_then_end_token():
-    # The model quotes the ｜DSML｜ marker inside reasoning and closes </think>
+    # The model quotes the ｜DSML｜ marker inside reasoning and closes </thinking>
     # only later: streaming must NOT end reasoning at the literal (it defers to
-    # </think>), matching the non-streaming path.
+    # </thinking>), matching the non-streaming path.
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
     reasoning, content = _stream(
         parser,
-        ["I should emit a ", TC_OPEN, " block, but first more thought.", "</think>", "Answer."],
+        ["I should emit a ", TC_OPEN, " block, but first more thought.", "</thinking>", "Answer."],
     )
     assert reasoning == f"I should emit a {TC_OPEN} block, but first more thought."
     assert content == "Answer."
@@ -146,7 +146,7 @@ def test_stream_dsml_literal_in_reasoning_then_end_token():
 def test_stream_flush_recovers_trailing_partial_content():
     # A trailing '<' (prefix of a tracked token) must be flushed, not dropped.
     parser = ReasoningParser("deepseekv32", force_reasoning=True)
-    reasoning, content = _stream(parser, ["thinking", "</think>", "value is x ", "<"])
+    reasoning, content = _stream(parser, ["thinking", "</thinking>", "value is x ", "<"])
     assert reasoning == "thinking"
     assert content == "value is x <"
 

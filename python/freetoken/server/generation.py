@@ -352,9 +352,9 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     thinking mode so chat-mode content is never mislabeled as reasoning."""
     parser_name = getattr(state.config, "reasoning_parser", None)
     if parser_name == "qwen3":
-        # The qwen3 chat template opens an implicit <think> (thinking on) unless
+        # The qwen3 chat template opens an implicit <thinking> (thinking on) unless
         # enable_thinking is explicitly false, so the model emits only the closing
-        # </think>. Mirror that default here, else the chain-of-thought leaks into content.
+        # </thinking>. Mirror that default here, else the chain-of-thought leaks into content.
         force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
     elif parser_name == "glm":
         # GLM's template honors enable_thinking (default on) even with tools; the

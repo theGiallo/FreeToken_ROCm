@@ -467,7 +467,7 @@ def _dsv4_state(replies):
 
 def test_dsv4_non_stream_splits_reasoning_and_tool_call():
     # tools present -> thinking mode -> output starts inside the reasoning block.
-    output = f"I should look up the weather.</think>Let me check.\n\n{_DSV4_TOOL_BLOCK}"
+    output = f"I should look up the weather.</thinking>Let me check.\n\n{_DSV4_TOOL_BLOCK}"
     state = _dsv4_state([UserReply(uid=42, incremental_output=output, finished=True)])
 
     response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
@@ -482,7 +482,7 @@ def test_dsv4_non_stream_splits_reasoning_and_tool_call():
 
 
 def test_dsv4_non_stream_missing_end_token_before_tool_block():
-    # dsv4 sometimes skips </think> and jumps straight to the tool block.
+    # dsv4 sometimes skips </thinking> and jumps straight to the tool block.
     output = f"Looking it up now.\n\n{_DSV4_TOOL_BLOCK}"
     state = _dsv4_state([UserReply(uid=42, incremental_output=output, finished=True)])
 
@@ -497,7 +497,7 @@ def test_dsv4_non_stream_missing_end_token_before_tool_block():
 
 def test_dsv4_non_stream_reasoning_without_tools():
     # No tools, but thinking explicitly requested.
-    output = "Let me think about it.</think>The answer is 42."
+    output = "Let me think about it.</thinking>The answer is 42."
     state = _dsv4_state([UserReply(uid=42, incremental_output=output, finished=True)])
     req = ChatCompletionRequest(
         model="client-model",
@@ -518,7 +518,7 @@ def test_dsv4_non_stream_reasoning_without_tools():
 def test_dsv4_non_stream_strips_leaked_special_tokens():
     bos = "<｜begin▁of▁sentence｜>"
     eos = "<｜end▁of▁sentence｜>"
-    output = f"reasoning here</think>Hello{eos} world{bos}"
+    output = f"reasoning here</thinking>Hello{eos} world{bos}"
     state = _dsv4_state([UserReply(uid=42, incremental_output=output, finished=True)])
     req = ChatCompletionRequest(
         model="client-model",
@@ -534,8 +534,8 @@ def test_dsv4_non_stream_strips_leaked_special_tokens():
 
 def test_dsv4_stream_emits_reasoning_then_tool_calls():
     # Token-aligned deltas (the detokenizer emits one token's text per message,
-    # so markers like </think> never arrive glued to preceding text).
-    chunks = ["Thinking ", "hard.", "</think>", "One ", "sec.", "\n\n", _DSV4_TOOL_BLOCK]
+    # so markers like </thinking> never arrive glued to preceding text).
+    chunks = ["Thinking ", "hard.", "</thinking>", "One ", "sec.", "\n\n", _DSV4_TOOL_BLOCK]
     replies = [
         UserReply(uid=42, incremental_output=c, finished=(i == len(chunks) - 1))
         for i, c in enumerate(chunks)
@@ -666,7 +666,7 @@ def test_stream_chat_usage_chunk_carries_cached_tokens():
 # --------------------------------------------------------------- minimax think
 def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob():
     state = FakeState(
-        [UserReply(uid=42, incremental_output="private thought</think>visible answer", finished=True)],
+        [UserReply(uid=42, incremental_output="private thought</thinking>visible answer", finished=True)],
         reasoning_parser="minimax",
     )
     req = chat_request(tools=None)

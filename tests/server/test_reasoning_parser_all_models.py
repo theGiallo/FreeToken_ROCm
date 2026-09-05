@@ -94,16 +94,16 @@ import pytest
 @pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
 def test_think_non_stream_splits_reasoning(name):
     parser = ReasoningParser(name, force_reasoning=False)
-    reasoning, content = parser.parse_non_stream("<think>weigh options</think>final answer")
+    reasoning, content = parser.parse_non_stream("<thinking>weigh options</thinking>final answer")
     assert reasoning == "weigh options"
     assert content == "final answer"
 
 
 @pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
 def test_think_implicit_only_closing_tag(name):
-    # Implicit-think: template injected the opening <think>; output starts inside.
+    # Implicit-think: template injected the opening <thinking>; output starts inside.
     parser = ReasoningParser(name, force_reasoning=True)
-    reasoning, content = parser.parse_non_stream("reasoning here</think>the answer")
+    reasoning, content = parser.parse_non_stream("reasoning here</thinking>the answer")
     assert reasoning == "reasoning here"
     assert content == "the answer"
 
@@ -160,6 +160,67 @@ def test_think_streaming_tool_call_after_close_routes_to_content():
     assert "<tool_call>" in content and "<function=write>" in content
     assert "<tool_call>" not in reasoning and "<function=" not in reasoning
     assert reasoning.startswith("I need to provide")
+
+
+# ------------------------------------------------- think-alias blocks
+def test_think_alias_non_stream_after_primary_close_routes_to_reasoning():
+    # Qwen3.6 wraps a stray "thought" section in this alias pair in addition to
+    # the <thinking> protocol block. It must land in reasoning_content, never
+    # leak as raw markup in the visible answer.
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(
+        "hidden thoughts</thinking>visible answer<thought>stray note</thought>tail"
+    )
+    assert reasoning == "hidden thoughtsstray note"
+    assert content == "visible answertail"
+    assert "<thinking>" not in reasoning + content
+    assert "</thinking>" not in reasoning + content
+    assert "<thought>" not in reasoning + content
+    assert "</thought>" not in reasoning + content
+
+
+def test_think_alias_streaming_after_primary_close_routes_to_reasoning():
+    # Streaming variant with the markers split across arbitrary chunk boundaries
+    # (including `<thought>` abutting `<` from `</thinking>`).
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = _stream(
+        parser,
+        [
+            "hidden thoughts",
+            "</thin",
+            "king>visible answer<thought>",
+            "stray note</",
+            "thought>tail",
+        ],
+    )
+    assert reasoning == "hidden thoughtsstray note"
+    assert content == "visible answertail"
+    assert "<" not in reasoning + content
+
+
+def test_think_alias_nested_opener_is_noise():
+    # An opener inside an already-open region is model noise: the nested
+    # copy is stripped, the region boundary logic still applies to the rest.
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = _stream(
+        parser,
+        ["pre<thinking>inner<", "/thinking>x<", "thought>", "y</thought>tail"],
+    )
+    # The nested <thinking> opener is stripped as noise; the primary closer
+    # still closes the block, so x lands in content, then <thought> reopens
+    # for y until the alias closer ends reasoning before tail.
+    assert reasoning == "preinnery"
+    assert content == "xtail"
+    assert "<" not in reasoning + content
+
+
+def test_think_alias_unbalanced_opener_truncates_to_reasoning():
+    # A lone opener with no closer at end-of-stream is truncated reasoning, not
+    # liability in content (mirrors the primary <thinking> behaviour).
+    parser = ReasoningParser("qwen3", force_reasoning=False)
+    reasoning, content = parser.parse_non_stream("plain<thought>no end")
+    assert reasoning == "no end"
+    assert content == "plain"
 
 
 # ----------------------------------------------------------------------- gemma
