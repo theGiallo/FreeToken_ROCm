@@ -91,6 +91,14 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        # KV-persist: dump the radix tree + referenced pages at shutdown and restore the
+        # matched session's prefix on demand after a restart. The persister loads the last
+        # snapshot (metadata only) during __init__.
+        from freetoken.scheduler.cache_persist import CachePersister
+
+        self.cache_persister = CachePersister(
+            config, self.cache_manager, self.engine.kv_cache, self.engine.linear_state_pool
+        )
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -296,6 +304,11 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        # Dump the radix tree + referenced pages BEFORE engine.shutdown tears down the graph
+        # runner and releases the KV buffer. Each TP rank writes its own rank-keyed snapshot.
+        persister = getattr(self, "cache_persister", None)
+        if persister is not None and persister.enabled:
+            persister.save()
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -520,6 +533,14 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            # KV-persist: restore a parked snapshot's pages for the exact session prefix of this
+            # request before it is admitted (a no-op for a cold prefix or when disabled). Skip
+            # while a cache rebuild is pending -- the rebuild discards the live tree anyway, so
+            # the restore would be wasted (and its freshly allocated pages reclaimed).
+            persister = getattr(self, "cache_persister", None)
+            if persister is not None and persister.enabled and self._pending_rebuild is None:
+                with self.engine_stream_ctx:
+                    persister.materialize(msg.input_ids, getattr(msg, "mm_embeds", None))
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)

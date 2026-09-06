@@ -18,6 +18,14 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     decode_log_interval: int = 40
     special_token_ckpt: bool = False
+    # Persist the KV/GDN prefix cache to disk and restore it per session on demand.
+    # kv_persist_dir None -> default_kv_cache_dir(). kv_persist_max_gb caps the snapshot
+    # blob (a save over budget is skipped); kv_persist_max_age_h makes older snapshots
+    # load as cold. See scheduler/cache_persist.py.
+    kv_persist: bool = False
+    kv_persist_dir: str | None = None
+    kv_persist_max_gb: int | None = None
+    kv_persist_max_age_h: float | None = None
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

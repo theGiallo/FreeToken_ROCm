@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -55,9 +56,25 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     tokenize_worker(**kwargs)
 
 
+def _install_sigterm_keyboardinterrupt() -> None:
+    """Make the supervisor's SIGTERM stop land in the graceful-shutdown path."""
+
+    if not hasattr(signal, "SIGTERM"):
+        return  # non-POSIX platforms keep their default death path
+
+    def _handle_term(signum: int, frame) -> None:  # noqa: ANN001 - stdlib frame type
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_term)
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
+
+    # SIGTERM -> KeyboardInterrupt so the existing handler below runs scheduler.shutdown(),
+    # which lets a KV-persist snapshot land before the engine tears down.
+    _install_sigterm_keyboardinterrupt()
 
     # published (not bound) here: the engine binds it after the allocator setup
     from freetoken.gpu_select import set_assigned_gpu

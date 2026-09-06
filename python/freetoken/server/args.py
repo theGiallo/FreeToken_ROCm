@@ -396,6 +396,46 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-persist",
+        action="store_true",
+        default=ServerArgs.kv_persist,
+        help=(
+            "Persist the KV/GDN prefix cache to disk at shutdown and restore the matched "
+            "session's prefix on demand after a restart (see scheduler/cache_persist.py)."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-persist-dir",
+        type=str,
+        default=ServerArgs.kv_persist_dir,
+        help=(
+            "Directory holding KV snapshots (one per model geometry). Default: "
+            "$XDG_CACHE_HOME/ft/KV_cache (or ~/.cache/ft/KV_cache)."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-persist-max-gb",
+        type=int,
+        default=ServerArgs.kv_persist_max_gb,
+        help=(
+            "Skip writing a KV snapshot whose blobs exceed this size in GiB. "
+            "Unset = unlimited."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-persist-max-age-h",
+        type=float,
+        default=ServerArgs.kv_persist_max_age_h,
+        help=(
+            "Load a KV snapshot only if it is younger than this many hours; "
+            "older snapshots serve cold. Unset = keep forever."
+        ),
+    )
+
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,
