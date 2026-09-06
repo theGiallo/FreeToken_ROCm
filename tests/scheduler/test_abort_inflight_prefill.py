@@ -150,6 +150,42 @@ def test_abort_inflight_intermediate_chunk_marks_then_drains():
     cm.check_integrity()
 
 
+def test_abort_mid_chunk_commits_prefix_for_retry():
+    """An abort mid-chunked-prefill must leave the completed prefix reusable: the drain
+    frees the chunk via cache_req(finished=True) (the finish-donate), so a byte-identical
+    retry must match a prefix -- the live pi aborts re-prefilled cold (#cached-token: 0)."""
+    pool, cm, tm, _dm, pm, sent, stub = _setup()
+    prompt = torch.arange(1, 13, dtype=torch.int32)
+    chunk = _launch_req(pool, cm, tm, prompt[:8], cls=ChunkedReq)
+    pending = PendingReq(uid=UID, input_ids=prompt,
+                         sampling_params=SamplingParams(max_tokens=4))
+    pending.chunked_req = chunk
+    pm.pending_list = [pending]
+    batch = Batch(reqs=[chunk], phase="prefill")
+    stub._last_data = _as_last_data(batch)
+
+    Scheduler._process_one_msg(stub, AbortBackendMsg(uid=UID))
+    Scheduler._process_last_data(stub, stub._last_data)
+
+    assert chunk.table_idx == -1
+    assert sent == []
+    cm.check_integrity()
+
+    mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt), mm_embeds=None))
+    assert mr.cuda_handle.cached_len == 8, (
+        f"aborted prefix not committed; matched {mr.cuda_handle.cached_len}"
+    )
+    assert mr.mamba_value is not None
+
+    pm.add_one_req(SimpleNamespace(
+        uid=UID + 1, input_ids=prompt,
+        sampling_params=SamplingParams(max_tokens=4), mm_embeds=None))
+    batch = pm.schedule_next_batch(256)
+    assert batch is not None
+    assert batch.prompt_admissions == [(UID + 1, 12, 8)]
+    assert batch.log_cached_tokens == 8
+
+
 def test_abort_starved_decode_req_frees_immediately():
     """A request with no forward in flight (e.g. a decode req starved behind a long
     chunked prefill) is freed by the abort handler right away -- deferring would leak
