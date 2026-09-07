@@ -223,6 +223,64 @@ def test_think_alias_unbalanced_opener_truncates_to_reasoning():
     assert content == "plain"
 
 
+# ------------------------------------------------------- answer-boundary token
+@pytest.mark.parametrize("name", ["qwen3", "glm", "minimax"])
+def test_think_answer_boundary_ends_reasoning(name):
+    # The qwen3 fine-tune sometimes closes reasoning with the single BPE token
+    # " response" (id 1965) instead of </thinking>. It is line-anchored; the
+    # answer text after it must land in content, not reasoning_content.
+    parser = ReasoningParser(name, force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(
+        "The code compiled.\n response\n\nThe code compiles and the fixes are:\n1. done"
+    )
+    assert reasoning == "The code compiled."
+    assert content == "The code compiles and the fixes are:\n1. done"
+    assert "response" not in reasoning
+    assert "response" not in content
+
+
+def test_think_answer_boundary_streaming_split_across_chunks():
+    # Streaming variant with the boundary token split across chunks, including the
+    # leading newline arriving separately from " response".
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = _stream(
+        parser,
+        [
+            "Looking at the context,",
+            "\n\n",
+            " response",
+            "\n\nThe code compiles and I made these final fixes.",
+        ],
+    )
+    assert reasoning.strip() == "Looking at the context,"
+    assert content.lstrip() == "The code compiles and I made these final fixes."
+
+
+def test_think_answer_boundary_midline_response_does_not_close():
+    # A mid-sentence "response" (not anchored to a line start) is reasoning
+    # prose, not the answer boundary; only the later line-anchored marker closes.
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(
+        "weigh the user response and our reply\n response\nfinal"
+    )
+    assert reasoning == "weigh the user response and our reply"
+    assert content == "final"
+
+
+def test_think_answer_boundary_before_tool_call_takes_precedence():
+    # When the model emits the boundary AND then a tool block, reasoning ends at
+    # the boundary and the tool block stays in content for the tool parser.
+    stream = (
+        "I need the weather.\n response\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nParis\n</parameter>\n</tool_call>"
+    )
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(stream)
+    assert reasoning == "I need the weather."
+    assert content.startswith("<tool_call>")
+    assert "get_weather" in content
+
+
 # ----------------------------------------------------------------------- gemma
 def test_gemma_thought_split():
     parser = ReasoningParser("gemma4", force_reasoning=True)

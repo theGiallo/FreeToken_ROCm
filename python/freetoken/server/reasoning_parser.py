@@ -40,6 +40,13 @@ THOUGHT_START_TOKEN = "<thought>"
 THOUGHT_END_TOKEN = "</thought>"
 DSML_TOKEN = "｜DSML｜"
 
+# The qwen3 provider's fine-tune sometimes ends its reasoning block with the
+# single BPE token " response" (id 1965) instead of the literal </thinking> tags:
+# it is the model's answer-start boundary and carries no angle brackets. The
+# parser anchors it to a line start so ordinary mid-sentence "response" inside
+# reasoning never ends the block.
+ANSWER_BOUNDARY_TOKEN = " response"
+
 DSV4_SPECIAL_TOKENS: List[str] = [
     BOS_TOKEN,
     EOS_TOKEN,
@@ -111,6 +118,8 @@ class BaseReasoningParser:
             block as ``think_start_token`` (e.g. the Qwen3.6 ``<thought>`` alias).
         alt_end_token: Optional closer paired with ``alt_start_token``; the first
             closer of either flavour ends reasoning.
+        answer_boundary_token: Optional line-anchored boundary that ends reasoning
+            when no closer was typed (the qwen3 `` response`` answer marker).
     """
 
     # Max bytes a suspected tool block is held while waiting for a possible later
@@ -127,12 +136,19 @@ class BaseReasoningParser:
         tool_start_token: Optional[str] = None,
         alt_start_token: Optional[str] = None,
         alt_end_token: Optional[str] = None,
+        answer_boundary_token: Optional[str] = None,
     ) -> None:
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self.tool_start_token = tool_start_token
         self.alt_start_token = alt_start_token
         self.alt_end_token = alt_end_token
+        self.answer_boundary_token = answer_boundary_token
+        self._answer_boundary_re = (
+            re.compile(r"(?m)^[ \t]*" + re.escape(answer_boundary_token.lstrip()))
+            if answer_boundary_token
+            else None
+        )
         self.force_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
@@ -149,6 +165,18 @@ class BaseReasoningParser:
     @property
     def _closers(self) -> List[str]:
         return [t for t in (self.think_end_token, self.alt_end_token) if t]
+
+    def _reasoning_end(self, text: str) -> Optional[Tuple[int, int]]:
+        """Earliest ``(start, end)`` of a reasoning-end marker in ``text``: a
+        closer of either flavour, or the answer-boundary token anchored to a line
+        start (`` response``). Returns None while the reasoning block is open."""
+        hit = self._first_marker(text, self._closers)
+        best = (hit[0], hit[0] + len(hit[1])) if hit is not None else None
+        if self._answer_boundary_re is not None:
+            m = self._answer_boundary_re.search(text)
+            if m is not None and (best is None or m.start() < best[0]):
+                best = (m.start(), m.end())
+        return best
 
     @staticmethod
     def _first_marker(text: str, tokens: List[str]) -> Optional[Tuple[int, str]]:
@@ -182,13 +210,13 @@ class BaseReasoningParser:
         content: List[str] = []
         for _ in range(4):
             if in_reasoning:
-                hit = self._first_marker(current, self._closers)
-                if hit is not None:
-                    idx, marker = hit
+                end = self._reasoning_end(current)
+                if end is not None:
+                    idx, stop = end
                     reasoning.append(
                         self._strip_all(current[:idx], self._openers).rstrip()
                     )
-                    current = current[idx + len(marker):]
+                    current = current[stop:]
                     in_reasoning = False
                     continue
                 # No closer: a tool block ends reasoning there, or the block is
@@ -240,13 +268,13 @@ class BaseReasoningParser:
                 # A complete closer of either flavour ends reasoning. Checked
                 # BEFORE the tool marker so a quoted tool block inside reasoning
                 # is reclaimed when the closer finally arrives.
-                hit = self._first_marker(current, self._closers)
-                if hit is not None:
-                    idx, marker = hit
+                end = self._reasoning_end(current)
+                if end is not None:
+                    idx, stop = end
                     reasoning_parts.append(
                         self._strip_all(current[:idx], self._openers).rstrip()
                     )
-                    current = current[idx + len(marker):]
+                    current = current[stop:]
                     self._in_reasoning = False
                     self._reasoning_closed = True
                     continue
@@ -317,6 +345,8 @@ class BaseReasoningParser:
         tokens.extend(self._openers)
         if self.tool_start_token:
             tokens.append(self.tool_start_token)
+        if self.answer_boundary_token:
+            tokens.append(self.answer_boundary_token)
         best = 0
         for tok in tokens:
             for k in range(min(len(tok) - 1, len(text)), best, -1):
@@ -505,6 +535,7 @@ class ThinkReasoningParser(BaseReasoningParser):
             tool_start_token="<tool_call>",
             alt_start_token=THOUGHT_START_TOKEN,
             alt_end_token=THOUGHT_END_TOKEN,
+            answer_boundary_token=ANSWER_BOUNDARY_TOKEN,
         )
 
 
