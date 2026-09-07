@@ -281,6 +281,73 @@ def test_think_answer_boundary_before_tool_call_takes_precedence():
     assert "get_weather" in content
 
 
+# --------------------------------------------------- answer envelope stripping
+def test_think_answer_envelope_stripped_from_content():
+    # The qwen3.6 "thinking-official" fine-tune wraps its answer in an
+    # <answer_prompt> envelope and emits an empty <function_call> placeholder when
+    # it declines its tool list. Both are framing and must not reach the client.
+    text = (
+        "Let me verify the spawn position.\n response\n\n"
+        "<answer_prompt>\n<function_call>\n</function_call>\n"
+        "The log confirms the diagnosis. Ducks spawn from row -5.\n"
+    )
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(text)
+    assert reasoning == "Let me verify the spawn position."
+    assert content == "The log confirms the diagnosis. Ducks spawn from row -5."
+    assert "<answer_prompt>" not in reasoning + content
+    assert "<function_call>" not in reasoning + content
+
+
+def test_think_answer_prompt_alone_closes_reasoning():
+    # The model can skip  response entirely and jump straight into the envelope;
+    # the line-anchored <answer_prompt> opener must end reasoning by itself.
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(
+        "weigh the options\n<answer_prompt>\nThe answer text."
+    )
+    assert reasoning == "weigh the options"
+    assert content == "The answer text."
+
+
+def test_think_answer_envelope_streaming_split_across_chunks():
+    # Streaming variant with every marker split at arbitrary chunk boundaries,
+    # including the empty <function_call> placeholder arriving one piece at a time.
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = _stream(
+        parser,
+        [
+            "The user says continue.\n",
+            " resp",
+            "onse\n\n<answer_pr",
+            "ompt>\n<function",
+            "_call>\n</function_c",
+            "all>\nThe answer.",
+        ],
+    )
+    assert reasoning.strip() == "The user says continue."
+    assert content.lstrip() == "The answer."
+    assert "<" not in content
+
+
+def test_think_nonempty_function_call_survives_for_tool_parser():
+    # A <function_call> block carrying a payload is real tool-call drift: only the
+    # EMPTY placeholder collapses, so the full block stays in content for the tool
+    # parser.
+    text = (
+        "need to run ls\n response\n\n"
+        "<answer_prompt><function_call>{"
+        '"name":"bash","arg":{"command":"ls"}}</function_call></answer_prompt>\n'
+        "Waiting for result."
+    )
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(text)
+    assert reasoning == "need to run ls"
+    assert "<answer_prompt>" not in content
+    assert "<function_call>" in content
+    assert '"command":"ls"' in content
+
+
 # ----------------------------------------------------------------------- gemma
 def test_gemma_thought_split():
     parser = ReasoningParser("gemma4", force_reasoning=True)

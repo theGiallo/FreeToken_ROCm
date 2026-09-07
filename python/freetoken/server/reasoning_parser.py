@@ -42,10 +42,22 @@ DSML_TOKEN = "｜DSML｜"
 
 # The qwen3 provider's fine-tune sometimes ends its reasoning block with the
 # single BPE token " response" (id 1965) instead of the literal </thinking> tags:
-# it is the model's answer-start boundary and carries no angle brackets. The
-# parser anchors it to a line start so ordinary mid-sentence "response" inside
-# reasoning never ends the block.
+# it is the model's answer-start boundary and carries no angle brackets, or it
+# jumps straight to the <answer_prompt> envelope. Both are anchored to a line
+# start so ordinary mid-sentence "response" inside reasoning never ends the block.
 ANSWER_BOUNDARY_TOKEN = " response"
+ANSWER_PROMPT_TOKEN = "<answer_prompt>"
+# Qwen3.6 "thinking-official" wraps its text answer in an <answer_prompt> envelope
+# and emits an empty <function_call>...</function_call> placeholder when declining
+# its tool list. The envelope is framing, not output: the parser strips it from
+# content, but a NON-empty <function_call> block survives for the tool parser.
+ANSWER_ENVELOPE_TOKENS = (
+    ANSWER_PROMPT_TOKEN,
+    "</answer_prompt>",
+    "<function_call>",
+    "</function_call>",
+)
+EMPTY_FUNCTION_CALL_RE = re.compile(r"<function_call>\s*</function_call>")
 
 DSV4_SPECIAL_TOKENS: List[str] = [
     BOS_TOKEN,
@@ -118,8 +130,14 @@ class BaseReasoningParser:
             block as ``think_start_token`` (e.g. the Qwen3.6 ``<thought>`` alias).
         alt_end_token: Optional closer paired with ``alt_start_token``; the first
             closer of either flavour ends reasoning.
-        answer_boundary_token: Optional line-anchored boundary that ends reasoning
-            when no closer was typed (the qwen3 `` response`` answer marker).
+        answer_boundary_tokens: Optional line-anchored boundaries that end reasoning
+            when no closer was typed (the qwen3 `` response`` mark and its
+            ``<answer_prompt>`` envelope opener).
+        content_strip_tokens: Optional marker strings to remove from routed content.
+        content_strip_re: Optional regex applied to routed content (e.g. an empty
+            ``<function_call>`` placeholder collapse).
+        hold_tokens: Optional marker strings tracked for stream reassembly (held
+            at chunk edges) without being stripped.
     """
 
     # Max bytes a suspected tool block is held while waiting for a possible later
@@ -136,24 +154,35 @@ class BaseReasoningParser:
         tool_start_token: Optional[str] = None,
         alt_start_token: Optional[str] = None,
         alt_end_token: Optional[str] = None,
-        answer_boundary_token: Optional[str] = None,
+        answer_boundary_tokens: Optional[Sequence[str]] = None,
+        content_strip_tokens: Optional[Sequence[str]] = None,
+        content_strip_re: Optional[re.Pattern] = None,
+        hold_tokens: Optional[Sequence[str]] = None,
     ) -> None:
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self.tool_start_token = tool_start_token
         self.alt_start_token = alt_start_token
         self.alt_end_token = alt_end_token
-        self.answer_boundary_token = answer_boundary_token
-        self._answer_boundary_re = (
-            re.compile(r"(?m)^[ \t]*" + re.escape(answer_boundary_token.lstrip()))
-            if answer_boundary_token
-            else None
-        )
+        self.answer_boundary_tokens = list(answer_boundary_tokens or ())
+        self._answer_boundary_res = [
+            re.compile(r"(?m)^[ \t]*" + re.escape(token.lstrip()))
+            for token in self.answer_boundary_tokens
+        ]
+        self._content_strip_tokens = list(content_strip_tokens or ())
+        self._content_strip_re = content_strip_re
+        self._hold_tokens = list(hold_tokens or ())
         self.force_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
         self._in_reasoning = force_reasoning
         self._buffer = ""
+        # Content held back because it is only the answer envelope so far (an
+        # <answer_prompt> / empty <function_call> split across stream chunks).
+        self._content_deferred = ""
+        # True between a <function_call> opener and its closer, whose empty-pair
+        # collapse must not leak mid-stream.
+        self._fc_open = False
         # Once a closer has ended reasoning, a later primary opener in content is
         # data (minimax anchor-first convention); only the alias opener reopens.
         self._reasoning_closed = False
@@ -168,12 +197,12 @@ class BaseReasoningParser:
 
     def _reasoning_end(self, text: str) -> Optional[Tuple[int, int]]:
         """Earliest ``(start, end)`` of a reasoning-end marker in ``text``: a
-        closer of either flavour, or the answer-boundary token anchored to a line
-        start (`` response``). Returns None while the reasoning block is open."""
+        closer of either flavour, or a line-anchored answer boundary (`` response``
+        or the ``<answer_prompt>`` envelope opener). None while the block is open."""
         hit = self._first_marker(text, self._closers)
         best = (hit[0], hit[0] + len(hit[1])) if hit is not None else None
-        if self._answer_boundary_re is not None:
-            m = self._answer_boundary_re.search(text)
+        for boundary in self._answer_boundary_res:
+            m = boundary.search(text)
             if m is not None and (best is None or m.start() < best[0]):
                 best = (m.start(), m.end())
         return best
@@ -187,6 +216,17 @@ class BaseReasoningParser:
             if idx != -1 and (best is None or idx < best[0]):
                 best = (idx, tok)
         return best
+
+    def _strip_content(self, text: str) -> str:
+        """Remove framing markers from routed content: the configured
+        ``content_strip_tokens`` (e.g. ``<answer_prompt>``/``</answer_prompt>``)
+        and anything matched by ``content_strip_re`` (e.g. an empty
+        ``<function_call>`` placeholder). A non-empty ``<function_call>`` block is
+        left intact for the tool parser."""
+        text = self._strip_all(text, self._content_strip_tokens)
+        if self._content_strip_re is not None:
+            text = self._content_strip_re.sub("", text)
+        return text
 
     @staticmethod
     def _strip_all(text: str, tokens: List[str]) -> str:
@@ -242,7 +282,7 @@ class BaseReasoningParser:
             in_reasoning = True
         return ReasoningParseResult(
             reasoning_text="".join(reasoning).strip(),
-            normal_text="".join(content).strip(),
+            normal_text=self._strip_content("".join(content)).strip(),
         )
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
@@ -299,7 +339,7 @@ class BaseReasoningParser:
                     return ReasoningParseResult(
                         reasoning_text="".join(reasoning_parts)
                         + self._strip_all(current[:tool_idx], self._openers),
-                        normal_text="".join(content_parts),
+                        normal_text=self._strip_content("".join(content_parts)),
                     )
                 # No structural event yet: strip nested openers as noise.
                 current = self._strip_all(current, self._openers)
@@ -312,29 +352,101 @@ class BaseReasoningParser:
                 break
             idx, marker = hit
             if self._reasoning_closed and marker != self.alt_start_token:
-                content_parts.append(current)
+                self._defer_content(current, content_parts)
                 current = ""
                 break
-            content_parts.append(current[:idx])
+            self._defer_content(current[:idx], content_parts)
             current = current[idx + len(marker):]
             self._in_reasoning = True
 
         safe, held = self._split_trailing_partial(current)
         if self._in_reasoning and not self.stream_reasoning:
             self._buffer = current  # accumulate until the closing marker
-            return ReasoningParseResult(
-                reasoning_text="".join(reasoning_parts),
-                normal_text="".join(content_parts),
-            )
+            return self._finalize(reasoning_parts, content_parts)
         self._buffer = held
         if self._in_reasoning:
             reasoning_parts.append(safe)
         else:
-            content_parts.append(safe)
+            self._defer_content(safe, content_parts)
+        return self._finalize(reasoning_parts, content_parts)
+
+    def _finalize(
+        self, reasoning_parts: List[str], content_parts: List[str]
+    ) -> ReasoningParseResult:
+        """Join the accumulated parts. Deferred answer-frame bytes stay pending in
+        ``_content_deferred`` until real prose resolves them, so they are not part
+        of the returned (accumulated) content."""
         return ReasoningParseResult(
             reasoning_text="".join(reasoning_parts),
-            normal_text="".join(content_parts),
+            normal_text=self._strip_content("".join(content_parts)),
         )
+
+    def _flush_deferred(self, content_parts: List[str]) -> None:
+        """Release a resolved/deferred answer frame into the accumulated parts."""
+        if self._content_deferred:
+            content_parts.append(self._strip_content(self._content_deferred))
+            self._content_deferred = ""
+
+    def _defer_content(self, text: str, content_parts: List[str]) -> None:
+        """Route one content segment. Real prose streams immediately; the answer
+        envelope is held so its tags never leak. ``<answer_prompt>``/``</answer_prompt>``
+        are pure frame and collapse via ``_strip_content``, but an empty
+        ``<function_call>...</function_call>`` placeholder whose tags arrive in
+        separate stream chunks must be held from its opener until its closer, then
+        dropped only if it collapsed to nothing; a non-empty body is real (tool)
+        content and is released."""
+        if not text:
+            return
+        # In the middle of a <function_call> block: hold until the closer resolves it.
+        if self._fc_open:
+            pos = text.find("</function_call>")
+            if pos == -1:
+                self._content_deferred += text
+                return
+            body = self._content_deferred + text[: pos + len("</function_call>")]
+            self._content_deferred = ""
+            self._fc_open = False
+            tail = text[pos + len("</function_call>"):]
+            if not EMPTY_FUNCTION_CALL_RE.search(body):
+                content_parts.append(self._strip_content(body))
+            if tail:
+                self._defer_content(tail, content_parts)
+            return
+        open_pos = text.find("<function_call>")
+        if open_pos != -1:
+            close_pos = text.find("</function_call>", open_pos + len("<function_call>"))
+            if close_pos == -1:
+                # Opener without its closer yet: defer it (and anything before it
+                # that is frame only).
+                self._content_deferred += text[open_pos:]
+                self._fc_open = True
+                head = text[:open_pos]
+                if head.strip():
+                    content_parts.append(self._strip_content(head))
+                return
+            # Complete pair in this text: emit the part before it, then resolve it.
+            body = text[open_pos : close_pos + len("</function_call>")]
+            head = text[:open_pos]
+            if head.strip():
+                content_parts.append(self._strip_content(head))
+            if not EMPTY_FUNCTION_CALL_RE.search(body):
+                content_parts.append(self._strip_content(body))
+            tail = text[close_pos + len("</function_call>"):]
+            if tail:
+                self._defer_content(tail, content_parts)
+            return
+        # No function_call: resolve any held frame, then emit real prose or hold
+        # pure frame.
+        stripped = self._strip_content(text)
+        if stripped.strip():
+            self._flush_deferred(content_parts)
+            content_parts.append(stripped)
+            return
+        if self._hold_tokens and any(tok in text for tok in self._hold_tokens):
+            self._content_deferred += text
+            return
+        if stripped:
+            content_parts.append(stripped)
 
     def _split_trailing_partial(self, text: str) -> Tuple[str, str]:
         """Split off the longest suffix of ``text`` that is a *proper* prefix of a
@@ -345,14 +457,21 @@ class BaseReasoningParser:
         tokens.extend(self._openers)
         if self.tool_start_token:
             tokens.append(self.tool_start_token)
-        if self.answer_boundary_token:
-            tokens.append(self.answer_boundary_token)
+        tokens.extend(self.answer_boundary_tokens)
+        tokens.extend(self._content_strip_tokens)
+        tokens.extend(self._hold_tokens)
         best = 0
         for tok in tokens:
             for k in range(min(len(tok) - 1, len(text)), best, -1):
                 if text.endswith(tok[:k]):
                     best = k
                     break
+        # Hold-only markers (the answer envelope) may also be held when they arrive
+        # COMPLETE at the chunk end, so an empty <function_call> placeholder split
+        # across chunks still collapses once its pair reassembles.
+        for tok in self._hold_tokens:
+            if tok and len(tok) > best and text.endswith(tok):
+                best = len(tok)
         if best == 0:
             return text, ""
         return text[:-best], text[-best:]
@@ -370,14 +489,27 @@ class BaseReasoningParser:
         """
         buf = self._buffer
         self._buffer = ""
+        # A trailing answer frame that never resolved into real prose is framing:
+        # drop it (it collapses to nothing) rather than leak raw tags.
+        deferred = self._content_deferred
+        self._content_deferred = ""
+        self._fc_open = False
         if not buf:
+            if deferred:
+                return ReasoningParseResult(normal_text=self._strip_content(deferred))
             return ReasoningParseResult()
         if self.tool_start_token and buf.lstrip().startswith(self.tool_start_token):
             self._in_reasoning = False
-            return ReasoningParseResult(normal_text=buf)
+            return ReasoningParseResult(
+                normal_text=self._strip_content(deferred + buf)
+            )
         if self._in_reasoning:
             return ReasoningParseResult(reasoning_text=buf)
-        return ReasoningParseResult(normal_text=self._strip_all(buf, self._closers))
+        return ReasoningParseResult(
+            normal_text=self._strip_content(
+                self._strip_all(deferred + buf, self._closers)
+            )
+        )
 
 class DeepSeekV32ReasoningParser(BaseReasoningParser):
     """Reasoning parser for DeepSeek-V4 and DeepSeek-V3.2 (same ``<thinking>`` +
@@ -535,7 +667,10 @@ class ThinkReasoningParser(BaseReasoningParser):
             tool_start_token="<tool_call>",
             alt_start_token=THOUGHT_START_TOKEN,
             alt_end_token=THOUGHT_END_TOKEN,
-            answer_boundary_token=ANSWER_BOUNDARY_TOKEN,
+            answer_boundary_tokens=[ANSWER_BOUNDARY_TOKEN, ANSWER_PROMPT_TOKEN],
+            content_strip_tokens=(ANSWER_PROMPT_TOKEN, "</answer_prompt>"),
+            content_strip_re=EMPTY_FUNCTION_CALL_RE,
+            hold_tokens=ANSWER_ENVELOPE_TOKENS,
         )
 
 
