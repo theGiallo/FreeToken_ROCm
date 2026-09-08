@@ -16,6 +16,10 @@ class SchedulerStatusReporter:
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
+    # Last measured prefill input throughput (new tokens / s), exposed so the scheduler can
+    # stamp it on reply messages and the frontend can surface it via /v1/stats. Updated only
+    # on prefill batch reports; holds its last value the rest of the time.
+    last_input_tps: float = field(default=0.0)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -77,6 +81,7 @@ class SchedulerStatusReporter:
         new_tokens = batch.log_new_tokens
         cached_tokens = batch.log_cached_tokens
         input_throughput = new_tokens / gap if gap > 0 else 0.0
+        self.last_input_tps = input_throughput
         self.log(
             f"Prefill batch, "
             f"#new-seq: {len(batch.reqs)}, "

@@ -48,6 +48,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Scheduler-measured prefill input throughput (new tokens / s) for the last prefill
+    # batch, carried so the frontend's /v1/stats can surface it without recomputing.
+    input_tps: float = 0.0
 
 
 @dataclass
@@ -63,6 +66,31 @@ class PromptAdmittedMsg(BaseTokenizerMsg):
     uid: int
     prompt_tokens: int
     cached_tokens: int = 0
+    # Scheduler-measured prefill input throughput (new tokens / s) as of this admission,
+    # carried onto the frontend usage reply so /v1/stats shows it even when a prefill-only
+    # workload produces no sampled DetokenizeMsg replies to stamp.
+    input_tps: float = 0.0
+
+
+@dataclass
+class BatchStatusMsg(BaseTokenizerMsg):
+    """Scheduler -> tokenizer -> frontend per-batch signal for prefill-only batches.
+
+    A request whose prompt is longer than one chunk prefills in several ChunkedReq
+    batches that publish no DetokenizeMsg (there is no sampled token yet) and, after
+    the first, no PromptAdmittedMsg either. This message carries the same snapshot the
+    scheduler stamps on sampled replies (input_tps + KV/mem usage) so the frontend's
+    /v1/stats stays live even while a prefill-only workload shows nothing else.
+    """
+
+    input_tps: float = 0.0
+    kv_used_pages: int = 0
+    kv_total_pages: int = 0
+    mamba_used_slots: int = 0
+    mamba_total_slots: int = 0
+    swa_used_tokens: int = 0
+    swa_total_tokens: int = 0
+    gpu_mem_bytes: int = 0
 
 
 @dataclass

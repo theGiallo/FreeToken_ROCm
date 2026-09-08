@@ -207,7 +207,8 @@ def _format_stats(doc: dict[str, Any]) -> str:
         ),
         (
             f"throughput decode_tps={throughput.get('decode_tps', 0)} "
-            f"prefill_tps={throughput.get('prefill_tps', 0)}"
+            f"prefill_tps={throughput.get('prefill_tps', 0)} "
+            f"input_tps={throughput.get('input_tps', 0)}"
         ),
         (
             f"requests active={requests.get('active', 0)} "

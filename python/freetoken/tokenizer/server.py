@@ -12,6 +12,7 @@ from freetoken.message import (
     BaseTokenizerMsg,
     BatchBackendMsg,
     BatchFrontendMsg,
+    BatchStatusMsg,
     BatchTokenizerMsg,
     CacheRebuildBackendMsg,
     CacheRebuildMsg,
@@ -20,6 +21,7 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
+    SchedulerStatusMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -47,6 +49,7 @@ def _prompt_admitted_reply(msg: PromptAdmittedMsg) -> UserReply:
         finished=False,
         prompt_tokens_delta=msg.prompt_tokens,
         cached_tokens=msg.cached_tokens,
+        input_tps=msg.input_tps,
     )
 
 
@@ -194,10 +197,32 @@ def tokenize_worker(
                             error=m.error,
                         )
                     )
+                elif isinstance(m, BatchStatusMsg):
+                    # Chunked-prefill per-batch status: no uid, mirrored straight to the
+                    # frontend's StatsTracker (never routed to an ack queue). Keeps /v1/stats
+                    # live while a prefill-only workload produces no sampled replies.
+                    send_frontend.put(
+                        SchedulerStatusMsg(
+                            input_tps=m.input_tps,
+                            kv_used_pages=m.kv_used_pages,
+                            kv_total_pages=m.kv_total_pages,
+                            mamba_used_slots=m.mamba_used_slots,
+                            mamba_total_slots=m.mamba_total_slots,
+                            swa_used_tokens=m.swa_used_tokens,
+                            swa_total_tokens=m.swa_total_tokens,
+                            gpu_mem_bytes=m.gpu_mem_bytes,
+                        )
+                    )
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (
+                        CacheRebuildMsg,
+                        CacheRebuildResultMsg,
+                        ErrorReplyMsg,
+                        PromptAdmittedMsg,
+                        BatchStatusMsg,
+                    ),
                 )
                 for m in pending_msg
             )
@@ -223,6 +248,7 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        input_tps=msg.input_tps,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

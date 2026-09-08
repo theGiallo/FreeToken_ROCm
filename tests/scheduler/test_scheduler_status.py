@@ -99,6 +99,26 @@ def test_swa_tokens_reported_only_when_provided():
     assert "swa usage: 0.11" in logs[-1]
 
 
+def test_last_input_tps_stamped_on_prefill_and_held_otherwise():
+    rep, logs, clock = _reporter()
+    clock["t"] = 0.25  # 30 new tokens over 0.25s -> 120 tok/s
+    rep.report_batch(
+        _prefill_batch(new_tokens=30, cached_tokens=12, n_seqs=2),
+        running_reqs=2, queue_reqs=1, kv_used_pages=50, kv_total_pages=200, page_size=16,
+    )
+    assert rep.last_input_tps == 120.0
+    # a decode emission does not touch it; the value holds for the next stamp
+    clock["t"] = 0.5
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=50, kv_total_pages=200, page_size=16)
+    assert rep.last_input_tps == 120.0
+    # zero-gap prefill is guarded and reports 0.0
+    rep.report_batch(_prefill_batch(new_tokens=0, cached_tokens=0, n_seqs=0),
+                     running_reqs=0, queue_reqs=0, kv_used_pages=0, kv_total_pages=0,
+                     page_size=1)
+    assert rep.last_input_tps == 0.0
+
+
 def test_decode_lines_are_throttled_to_every_nth_forward():
     rep, logs, clock = _reporter(interval=3)
     for i, t in enumerate((1.0, 1.5), start=1):

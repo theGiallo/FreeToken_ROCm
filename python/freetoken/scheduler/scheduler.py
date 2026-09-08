@@ -11,6 +11,7 @@ from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
+    BatchStatusMsg,
     CacheRebuildBackendMsg,
     CacheRebuildResultMsg,
     DetokenizeMsg,
@@ -406,18 +407,6 @@ class Scheduler(SchedulerIOMixin):
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
-        if reply:
-            mem = self._gpu_mem_bytes()
-            mamba_used, mamba_total = mamba_slots or (0, 0)
-            swa_used, swa_total = swa_tokens or (0, 0)
-            for m in reply:
-                m.kv_used_pages = used
-                m.kv_total_pages = total
-                m.mamba_used_slots = mamba_used
-                m.mamba_total_slots = mamba_total
-                m.swa_used_tokens = swa_used
-                m.swa_total_tokens = swa_total
-                m.gpu_mem_bytes = mem
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -428,7 +417,42 @@ class Scheduler(SchedulerIOMixin):
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
         )
+        if reply:
+            mem = self._gpu_mem_bytes()
+            mamba_used, mamba_total = mamba_slots or (0, 0)
+            swa_used, swa_total = swa_tokens or (0, 0)
+            input_tps = self.status_reporter.last_input_tps
+            for m in reply:
+                m.kv_used_pages = used
+                m.kv_total_pages = total
+                m.mamba_used_slots = mamba_used
+                m.mamba_total_slots = mamba_total
+                m.swa_used_tokens = swa_used
+                m.swa_total_tokens = swa_total
+                m.gpu_mem_bytes = mem
+                m.input_tps = input_tps
         self.send_result(reply)
+        if batch.is_prefill and not reply:
+            # A chunked-prefill batch publishes no DetokenizeMsg (the drained reqs are all
+            # ChunkedReq) and, after the first chunk, no PromptAdmittedMsg either -- so the
+            # freshly measured input_tps and KV/mem snapshot would never reach the frontend.
+            # Ship them on a lightweight status message instead of dropping them on the floor.
+            mamba_used, mamba_total = mamba_slots or (0, 0)
+            swa_used, swa_total = swa_tokens or (0, 0)
+            self.send_result(
+                [
+                    BatchStatusMsg(
+                        input_tps=self.status_reporter.last_input_tps,
+                        kv_used_pages=used,
+                        kv_total_pages=total,
+                        mamba_used_slots=mamba_used,
+                        mamba_total_slots=mamba_total,
+                        swa_used_tokens=swa_used,
+                        swa_total_tokens=swa_total,
+                        gpu_mem_bytes=self._gpu_mem_bytes(),
+                    )
+                ]
+            )
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -869,9 +893,15 @@ class Scheduler(SchedulerIOMixin):
         """
         if not batch.is_prefill or not batch.prompt_admissions:
             return
+        input_tps = self.status_reporter.last_input_tps
         self.send_result(
             [
-                PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
+                PromptAdmittedMsg(
+                    uid=uid,
+                    prompt_tokens=prompt_tokens,
+                    cached_tokens=cached_tokens,
+                    input_tps=input_tps,
+                )
                 for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
             ]
         )

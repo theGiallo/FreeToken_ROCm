@@ -7,20 +7,25 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
     BaseFrontendMsg,
     BaseTokenizerMsg,
+    BatchStatusMsg,
     CacheRebuildBackendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
     PromptAdmittedMsg,
+    SchedulerStatusMsg,
     TokenizeMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
+from freetoken.server.stats import StatsTracker, build_stats
 
 
 def test_cache_rebuild_msg_roundtrip():
@@ -54,10 +59,11 @@ def test_cache_rebuild_reply_roundtrip():
 
 
 def test_prompt_admitted_msg_roundtrip():
-    msg = PromptAdmittedMsg(uid=42, prompt_tokens=1234, cached_tokens=500)
+    msg = PromptAdmittedMsg(uid=42, prompt_tokens=1234, cached_tokens=500, input_tps=294.9)
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, PromptAdmittedMsg)
     assert (out.uid, out.prompt_tokens, out.cached_tokens) == (42, 1234, 500)
+    assert out.input_tps == 294.9
 
 
 def test_user_reply_token_deltas_round_trip():
@@ -71,6 +77,7 @@ def test_user_reply_token_deltas_round_trip():
         kv_used_pages=40,
         kv_total_pages=512,
         gpu_mem_bytes=64 * (1 << 30),
+        input_tps=146.9,
     )
 
     decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
@@ -85,6 +92,7 @@ def test_user_reply_token_deltas_round_trip():
     assert decoded.kv_used_pages == 40
     assert decoded.kv_total_pages == 512
     assert decoded.gpu_mem_bytes == 64 * (1 << 30)
+    assert decoded.input_tps == 146.9
 
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
@@ -93,12 +101,222 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
+        input_tps=146.9,
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+    assert decoded.input_tps == 146.9
+
+
+def test_stats_tracker_keeps_input_tps_as_last_known_value():
+    """input_tps is a scheduler-stamped last-known value, not a sliding-window rate, so the
+    tracker must retain it across replies even when the sliding-window prefill rate decays."""
+
+    stats = StatsTracker(window_s=5.0)
+    t0 = 1000.0
+    reply = UserReply(
+        uid=1, incremental_output="a", finished=False, prompt_tokens_delta=120,
+        input_tps=146.9, gpu_mem_bytes=1 << 30,
+    )
+    stats.observe(reply, now=t0)
+    assert stats.input_tps == 146.9
+    # a decode-only reply without a fresh input_tps leaves the last value in place
+    stats.observe(
+        UserReply(uid=1, incremental_output="b", finished=False, completion_tokens_delta=1),
+        now=t0 + 10.0,
+    )
+    assert stats.input_tps == 146.9
+    # input_tps == 0.0 (never stamped) must not clobber the held value
+    stats.observe(
+        UserReply(
+            uid=1, incremental_output="c", finished=False,
+            completion_tokens_delta=1, input_tps=0.0,
+        ),
+        now=t0 + 11.0,
+    )
+    assert stats.input_tps == 146.9
+    assert stats.prompt_tokens_total == 120
+
+
+def test_build_stats_exposes_input_tps_under_throughput():
+    stats = StatsTracker(window_s=5.0)
+    stats.on_new_user(uid=2)  # a request is admitted while its prefill runs
+    stats.observe(
+        UserReply(uid=2, incremental_output="a", finished=False, prompt_tokens_delta=120,
+                  input_tps=146.9),
+        now=1000.0,
+    )
+    config = SimpleNamespace(
+        served_model_name="model-a",
+        max_seq_len=4096,
+        page_size=16,
+        model_config=SimpleNamespace(
+            has_linear_attention=False, has_swa_attention=False, is_moe=False,
+        ),
+    )
+    state = SimpleNamespace(stats=stats, config=config, ready_at=None, instance_id="x", gpus=None)
+    doc = build_stats(state, p95_ms=12, ttft_mean_ms=5)
+    assert doc["throughput"]["input_tps"] == 146.9
+    assert doc["requests"]["prompt_tokens_total"] == 120
+
+
+def test_build_stats_zeroes_input_tps_when_idle():
+    """input_tps must read 0 when no request is admitted, mirroring decode/prefill."""
+    stats = StatsTracker(window_s=5.0)
+    stats.observe(
+        SchedulerStatusMsg(input_tps=325.8, kv_used_pages=40, kv_total_pages=512,
+                           mamba_used_slots=3, mamba_total_slots=16,
+                           swa_used_tokens=0, swa_total_tokens=0, gpu_mem_bytes=1 << 30),
+        now=1000.0,
+    )
+    assert stats.input_tps == 325.8  # last-known value held while a request runs
+    config = SimpleNamespace(
+        served_model_name="model-a", max_seq_len=4096, page_size=16,
+        model_config=SimpleNamespace(
+            has_linear_attention=False, has_swa_attention=False, is_moe=False,
+        ),
+    )
+    state = SimpleNamespace(stats=stats, config=config, ready_at=None, instance_id="x", gpus=None)
+    assert build_stats(state, p95_ms=12, ttft_mean_ms=5)["throughput"]["input_tps"] == 0.0
+    # an admitted request keeps the value visible
+    stats.on_new_user(uid=7)
+    assert build_stats(state, p95_ms=12, ttft_mean_ms=5)["throughput"]["input_tps"] == 325.8
+
+
+def test_last_request_recap_matches_llamacpp_timing_shape():
+    """The recap mirrors llama.cpp's per-request timings: input speed = processed prompt
+    tokens (cached subtracted) over the prompt-phase wall time, output speed = n_gen - 1
+    (first token is "free") over decode wall time, plus totals and a unique request id."""
+    stats = StatsTracker(window_s=5.0)
+    stats.on_new_user(uid=7)
+    stats.observe(
+        UserReply(uid=7, incremental_output="", finished=False, prompt_tokens_delta=120,
+                  cached_tokens=30),
+        now=1000.0,
+    )
+    # prompt phase: 500ms of prefill before the first sampled token
+    stats.observe(UserReply(uid=7, incremental_output="a", finished=False,
+                            completion_tokens_delta=1), now=1000.5)
+    # decode phase: 2s, three more output tokens (last one carries the terminal flag)
+    stats.observe(UserReply(uid=7, incremental_output="b", finished=False,
+                            completion_tokens_delta=1), now=1001.5)
+    stats.observe(UserReply(uid=7, incremental_output="c", finished=True,
+                            completion_tokens_delta=1), now=1002.5)
+
+    recap = stats.last_request
+    assert recap is not None
+    assert recap["id"] == 7
+    assert recap["input_tokens"] == 120
+    assert recap["output_tokens"] == 3
+    assert recap["cached_tokens"] == 30
+    assert recap["input_ms"] == 500
+    assert recap["output_ms"] == 2000
+    assert recap["duration_ms"] == 2500
+    # (120 - 30) / 0.5s = 180; (3 - 1) / 2s = 1.0
+    assert recap["input_tps"] == 180.0
+    assert recap["output_tps"] == 1.0
+    assert stats.active == 0
+    assert stats.completed == 1
+
+
+def test_last_request_recap_id_advances_and_never_repeats():
+    """The recap id is the request uid, so a poller keyed on (instance_id, id) counts each
+    finished request exactly once even when polls are sparse and several arrive in between."""
+    stats = StatsTracker(window_s=5.0)
+    for uid in (1, 2, 3):
+        stats.on_new_user(uid)
+        stats.observe(UserReply(uid=uid, incremental_output="", finished=False,
+                                prompt_tokens_delta=50, cached_tokens=0), now=2000.0 + uid)
+        stats.observe(UserReply(uid=uid, incremental_output="x", finished=True,
+                                completion_tokens_delta=10), now=2001.0 + uid)
+        assert stats.last_request["id"] == uid  # only the latest survives
+
+
+def test_last_request_recap_zero_token_error_keeps_id_advancing():
+    """A request that fails before producing tokens (tokenize error) still publishes a recap
+    so the id keeps moving — a poller must not re-count the previous request."""
+    stats = StatsTracker(window_s=5.0)
+    stats.on_new_user(uid=5)
+    stats.observe(UserReply(uid=5, incremental_output="", finished=True, error="boom"),
+                  now=3000.0)
+    recap = stats.last_request
+    assert recap["id"] == 5
+    assert recap["input_tokens"] == 0
+    assert recap["output_tokens"] == 0
+    assert recap["input_tps"] == 0.0
+    assert recap["output_tps"] == 0.0
+
+
+def test_last_request_recap_not_published_for_abort():
+    """Aborted requests must not replace the previous recap (mirrors `completed`). The prior
+    clean recap stays visible while the aborted uid is dropped from active."""
+    stats = StatsTracker(window_s=5.0)
+    stats.on_new_user(uid=8)
+    stats.observe(UserReply(uid=8, incremental_output="", finished=False,
+                            prompt_tokens_delta=20), now=4000.0)
+    stats.observe(UserReply(uid=8, incremental_output="a", finished=True,
+                            completion_tokens_delta=2), now=4001.0)
+    assert stats.last_request["id"] == 8
+
+    stats.on_new_user(uid=9)
+    stats.observe(UserReply(uid=9, incremental_output="", finished=False,
+                            prompt_tokens_delta=20), now=5000.0)
+    stats.on_abort(9)
+    stats.observe(UserReply(uid=9, incremental_output="b", finished=True,
+                            completion_tokens_delta=1), now=5001.0)
+    assert stats.last_request["id"] == 8  # previous recap retained
+    assert stats.active == 0
+    assert stats.completed == 1
+
+
+def test_batch_status_msg_roundtrip():
+    msg = BatchStatusMsg(
+        input_tps=325.8,
+        kv_used_pages=40,
+        kv_total_pages=512,
+        mamba_used_slots=7,
+        mamba_total_slots=64,
+        swa_used_tokens=8448,
+        swa_total_tokens=76800,
+        gpu_mem_bytes=1 << 30,
+    )
+    out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(out, BatchStatusMsg)
+    assert out.input_tps == 325.8
+    assert (out.kv_used_pages, out.kv_total_pages) == (40, 512)
+    assert (out.mamba_used_slots, out.mamba_total_slots) == (7, 64)
+    assert (out.swa_used_tokens, out.swa_total_tokens) == (8448, 76800)
+    assert out.gpu_mem_bytes == 1 << 30
+
+
+def test_scheduler_status_msg_roundtrip():
+    msg = SchedulerStatusMsg(
+        input_tps=325.8,
+        kv_used_pages=40,
+        kv_total_pages=512,
+        gpu_mem_bytes=1 << 30,
+    )
+    out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
+    assert isinstance(out, SchedulerStatusMsg)
+    assert out.input_tps == 325.8
+    assert (out.kv_used_pages, out.kv_total_pages) == (40, 512)
+    assert out.gpu_mem_bytes == 1 << 30
+
+
+def test_scheduler_status_msg_feeds_stats_tracker():
+    """The chunked-prefill status message must update the stats tracker's last-known
+    input_tps and mem/kv snapshot without being treated as a reply to any uid."""
+    stats = StatsTracker(window_s=5.0)
+    stats.observe(SchedulerStatusMsg(input_tps=325.8, kv_used_pages=40, kv_total_pages=512,
+                                     gpu_mem_bytes=1 << 30))
+    assert stats.input_tps == 325.8
+    assert (stats.kv_used_pages, stats.kv_total_pages) == (40, 512)
+    assert stats.vram_bytes == 1 << 30
+    assert stats.active == 0  # not a UserReply: must not touch inflight/completed
+    assert stats.prompt_tokens_total == 0
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():

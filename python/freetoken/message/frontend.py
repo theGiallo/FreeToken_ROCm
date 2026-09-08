@@ -45,6 +45,9 @@ class UserReply(BaseFrontendMsg):
     swa_total_tokens: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # Scheduler-measured prefill input throughput (new tokens / s), stamped on the sampled
+    # reply and forwarded so the frontend's /v1/stats can surface the scheduler's own number.
+    input_tps: float = 0.0
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would
@@ -68,3 +71,23 @@ class CacheRebuildReply(BaseFrontendMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+
+
+@dataclass
+class SchedulerStatusMsg(BaseFrontendMsg):
+    """tokenizer worker -> api server: per-batch scheduler status for prefill-only batches.
+
+    Mirrors the snapshot the scheduler stamps on sampled UserReply (input_tps + KV/mem
+    usage) but carries no uid and is never routed to an ack queue. listen() feeds it to
+    StatsTracker.observe so /v1/stats stays live while a chunked prefill emits nothing
+    else to the frontend.
+    """
+
+    input_tps: float = 0.0
+    kv_used_pages: int = 0
+    kv_total_pages: int = 0
+    mamba_used_slots: int = 0
+    mamba_total_slots: int = 0
+    swa_used_tokens: int = 0
+    swa_total_tokens: int = 0
+    gpu_mem_bytes: int = 0

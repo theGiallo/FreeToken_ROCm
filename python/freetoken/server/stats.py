@@ -1,7 +1,13 @@
 """Runtime metrics for /v1/stats. The FrontendManager owns one StatsTracker and feeds it
 every UserReply (the single chokepoint in listen()). kv/mamba/vram keep their last-known-value
 semantics like ShellStats; throughput uses an independent sliding-window rate (NOT cumulative
-average like tok_s), so idle polls decay to zero by wall clock."""
+average like tok_s), so idle polls decay to zero by wall clock. input_tps is the scheduler's
+own prefill throughput, stamped on status replies and kept as a last-known value in the tracker
+(prefill batches are seconds apart and a short window would decay to zero between them); it is
+reported as 0 whenever no request is admitted so an idle engine reads 0 like decode/prefill do.
+last_request is a per-request recap of the most recently finished request — the llama.cpp
+"slots.perf timings" shape (averages over that one request, not a sliding window), carrying the
+request's uid so consumers can key completions exactly once."""
 
 from __future__ import annotations
 
@@ -37,6 +43,16 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        # Scheduler-measured prefill input throughput (new tokens / s), last-known value.
+        self.input_tps = 0.0
+        # Per-request accumulation keyed by uid (created in on_new_user, finalized and
+        # removed when the terminal reply arrives). Lazy finalization yields last_request.
+        self._requests: "dict[int, dict]" = {}
+        # Recap of the most recently FINISHED request (llama.cpp slots.perf timings style):
+        # avg input/output speed over that single request + totals + unique id. None until
+        # the first request completes. Aborted requests do not publish a recap (the prior
+        # clean one stays), mirroring `completed` which excludes them too.
+        self.last_request: dict | None = None
 
     @property
     def active(self) -> int:
@@ -50,13 +66,74 @@ class StatsTracker:
     def on_new_user(self, uid: int) -> None:
         self._inflight.add(uid)
         self._aborting.discard(uid)
+        self._requests[uid] = {
+            "start": None,  # monotonic: first observed reply carrying prompt tokens
+            "first_out": None,  # monotonic: first sampled completion token
+            "finished": None,  # monotonic: terminal reply
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+        }
 
     def on_abort(self, uid: int) -> None:
         if uid in self._inflight:
             self._aborting.add(uid)
+            # An aborted request publishes no recap (the last clean one stays), and token
+            # samples racing the abort must not rebuild it — drop the accumulation now.
+            self._requests.pop(uid, None)
+
+    def _finalize_request(self, rec: dict, uid: int) -> dict | None:
+        """llama.cpp slots.perf-style recap for one finished request. From observed
+        monotonic timestamps: prompt phase runs from admission to the first completion
+        token, decode phase from there to the terminal reply. Input speed uses only the
+        tokens actually computed (llama.cpp n_prompt_processed, cached subtracted);
+        output speed counts n_gen - 1 (llama.cpp n_gen_steps — the first token rides the
+        last prompt batch's logits, so it is "free"). Always publishes a recap (a request
+        that finished with zero tokens, e.g. a tokenize error, reports 0 speeds) so the
+        recap id keeps advancing with every finished request — that monotonicity is what
+        lets a poller key each completion exactly once."""
+        prompt = rec["prompt_tokens"]
+        completion = rec["completion_tokens"]
+        cached = rec["cached_tokens"]
+        start = rec["start"]
+        first_out = rec["first_out"]
+        finished = rec["finished"]
+        if start is None:
+            start = finished
+        prompt_ms = (first_out - start) * 1e3 if first_out is not None else 0.0
+        decode_ms = (finished - first_out) * 1e3 if first_out is not None else 0.0
+        duration_ms = (finished - start) * 1e3
+        processed = max(0, prompt - cached)
+        input_tps = processed / (prompt_ms / 1e3) if prompt_ms > 0 else 0.0
+        output_tps = max(0, completion - 1) / (decode_ms / 1e3) if decode_ms > 0 else 0.0
+        return {
+            "id": uid,
+            "input_tokens": prompt,
+            "output_tokens": completion,
+            "cached_tokens": cached,
+            "input_ms": round(prompt_ms),
+            "output_ms": round(decode_ms),
+            "duration_ms": round(duration_ms),
+            "input_tps": round(input_tps, 1),
+            "output_tps": round(output_tps, 1),
+        }
 
     def observe(self, reply: Any, now: float | None = None) -> None:
         t = time.monotonic() if now is None else now
+        uid = getattr(reply, "uid", None)
+        rec = self._requests.get(uid) if uid is not None else None
+        if rec is not None and rec["finished"] is None:
+            if getattr(reply, "prompt_tokens_delta", 0) > 0:
+                if rec["start"] is None:
+                    rec["start"] = t
+                rec["prompt_tokens"] += reply.prompt_tokens_delta
+                rec["cached_tokens"] += getattr(reply, "cached_tokens", 0)
+            if getattr(reply, "completion_tokens_delta", 0) > 0:
+                if rec["first_out"] is None:
+                    rec["first_out"] = t
+                rec["completion_tokens"] += reply.completion_tokens_delta
+            if getattr(reply, "finished", False):
+                rec["finished"] = t
         if getattr(reply, "completion_tokens_delta", 0) > 0:
             self._decode.append((t, reply.completion_tokens_delta))
             self.completion_tokens_total += reply.completion_tokens_delta
@@ -74,14 +151,19 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        if getattr(reply, "input_tps", 0) > 0:
+            self.input_tps = reply.input_tps
         if getattr(reply, "finished", False):
-            uid = getattr(reply, "uid", None)
             if uid in self._inflight:
                 self._inflight.discard(uid)
                 if uid in self._aborting:
                     self._aborting.discard(uid)
+                    self._requests.pop(uid, None)
                 else:
                     self.completed += 1
+                    if rec is not None and rec["finished"] is not None:
+                        self.last_request = self._finalize_request(rec, uid)
+                    self._requests.pop(uid, None)
 
     def _rate(self, window: "deque[tuple[float, int]]", now: float | None) -> float:
         t = time.monotonic() if now is None else now
@@ -128,11 +210,18 @@ def _swa_page_size(config: Any) -> int:
 
 
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
-    """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
+    """Full /v1/stats doc. decode/prefill throughput are 0 when idle; input_tps is a
+    last-known scheduler measurement that reads 0 when no request is admitted (active == 0)
+    and holds its last prefill value while one is running. kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
     pages + the pool's own page_size (tokens = pages x page_size). gpus: the engine's GPU as
     [{index, name, uuid, total_bytes}] (the primary rank's; a list so TP can extend it), []
-    until the readiness meta arrives."""
+    until the readiness meta arrives. last_request: llama.cpp-recaps-style summary of the most
+    recently completed (non-aborted) request: {id (uid, unique per process), input_tokens,
+    output_tokens, cached_tokens, input_ms, output_ms, duration_ms, input_tps (prompt_tokens
+    minus cached / input wall time), output_tps ((output_tokens - 1) / output wall time)}.
+    None until one request has finished. monitor.py pairs last_request.id with instance_id to
+    key every completed request exactly once across polls."""
     tr: StatsTracker = state.stats
     config = state.config
     ready_at = getattr(state, "ready_at", None)
@@ -152,6 +241,9 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
+    # input_tps is a last-known scheduler measurement, so an idle engine (no admitted
+    # request) must report 0 like decode/prefill do, not whatever the last prefill hit.
+    input_tps = tr.input_tps if tr.active > 0 else 0.0
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
@@ -164,6 +256,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),
             "prefill_tps": round(tr.prefill_tps(), 1),
+            "input_tps": round(input_tps, 1),
         },
         "requests": {
             "active": tr.active,
@@ -172,5 +265,6 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "ttft_mean_ms": ttft_mean_ms,
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,
+            "last_request": tr.last_request,
         },
     }

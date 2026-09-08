@@ -24,6 +24,7 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    SchedulerStatusMsg,
     TokenizeMsg,
     UserReply,
 )
@@ -245,6 +246,11 @@ class FrontendManager:
             msg = await self.recv_tokenizer.get()
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
+                continue
+            if isinstance(msg, SchedulerStatusMsg):
+                # Chunked-prefill per-batch status: mirror the snapshot into the stats tracker
+                # so /v1/stats stays live, but never route it to an ack queue (no uid).
+                self.stats.observe(msg)
                 continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP

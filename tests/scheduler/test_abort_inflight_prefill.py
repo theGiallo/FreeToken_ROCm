@@ -22,7 +22,7 @@ import torch
 
 from freetoken.core import Batch, Req, SamplingParams
 from freetoken.kvcache.linear_state_pool import LinearStatePool
-from freetoken.message import AbortBackendMsg
+from freetoken.message import AbortBackendMsg, DetokenizeMsg
 from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.decode import DecodeManager
@@ -61,7 +61,8 @@ def _setup():
         eos_token_ids=set(),
         toolcall_anchor_id=None,
         config=SimpleNamespace(page_size=1),
-        status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
+        status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None,
+                                     last_input_tps=0.0),
         send_result=sent.extend,
         _kv_usage_pages=cm.page_usage,
         _mamba_slot_usage=lambda: None,
@@ -122,7 +123,9 @@ def test_abort_inflight_final_chunk_marks_then_drains():
     assert req.table_idx == -1                  # freed at the drain point
     assert pool.num_free_slots > free_after_mark
     assert req in stub.finished_reqs
-    assert sent == []                           # no DetokenizeMsg: abort ack stays terminal
+    # no DetokenizeMsg: abort ack stays terminal (BatchStatusMsg heartbeats are not
+    # uid replies and must still flow for prefill-only batches)
+    assert [m for m in sent if isinstance(m, DetokenizeMsg)] == []
     cm.check_integrity()
 
 
@@ -146,7 +149,7 @@ def test_abort_inflight_intermediate_chunk_marks_then_drains():
 
     Scheduler._process_last_data(stub, stub._last_data)
     assert chunk.table_idx == -1
-    assert sent == []                           # chunks never reply
+    assert [m for m in sent if isinstance(m, DetokenizeMsg)] == []  # chunks never reply
     cm.check_integrity()
 
 
@@ -168,7 +171,7 @@ def test_abort_mid_chunk_commits_prefix_for_retry():
     Scheduler._process_last_data(stub, stub._last_data)
 
     assert chunk.table_idx == -1
-    assert sent == []
+    assert [m for m in sent if isinstance(m, DetokenizeMsg)] == []
     cm.check_integrity()
 
     mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt), mm_embeds=None))
@@ -239,8 +242,6 @@ def test_post_terminal_overlap_step_is_dropped():
     """Overlap scheduling launches one more decode step for a request that already
     terminated (filter_reqs keeps it while output budget remains). The extra drain
     must not append its token, emit a second DetokenizeMsg, or free twice."""
-    from freetoken.message import DetokenizeMsg
-
     pool, cm, tm, dm, _pm, sent, stub = _setup()
     stub.eos_token_ids = {42}  # the drained token (42) finishes the request by EOS
     req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32),
