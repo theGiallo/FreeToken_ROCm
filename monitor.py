@@ -37,6 +37,7 @@ CSV_FIELDS = [
     "timestamp",
     "decode_tps",
     "prefill_tps",
+    "input_tps",
     "vram_bytes",
     "ram_available_bytes",
     "active",
@@ -45,6 +46,15 @@ CSV_FIELDS = [
     "completion_tokens_total",
     "ttft_mean_ms",
     "p95_ms",
+    "last_req_id",
+    "last_req_in_tps",
+    "last_req_out_tps",
+    "last_req_in_tokens",
+    "last_req_out_tokens",
+    "last_req_cached_tokens",
+    "last_req_in_ms",
+    "last_req_out_ms",
+    "last_req_duration_ms",
 ]
 
 
@@ -107,10 +117,12 @@ def _is_full_zero_row(row: dict) -> bool:
 
 
 def row_from_stats(d: dict) -> dict:
-    return {
+    lr = (d.get("requests") or {}).get("last_request")
+    row = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "decode_tps": f"{d['throughput']['decode_tps']:.2f}",
         "prefill_tps": f"{d['throughput']['prefill_tps']:.2f}",
+        "input_tps": f"{d['throughput']['input_tps']:.2f}",
         "vram_bytes": d["vram_bytes"],
         "ram_available_bytes": read_ram(),
         "active": d["requests"]["active"],
@@ -120,6 +132,22 @@ def row_from_stats(d: dict) -> dict:
         "ttft_mean_ms": f"{d['requests']['ttft_mean_ms']:.1f}",
         "p95_ms": f"{d['requests']['p95_ms']:.1f}",
     }
+    if lr:
+        row["last_req_id"] = lr["id"]
+        row["last_req_in_tps"] = f"{lr['input_tps']:.2f}"
+        row["last_req_out_tps"] = f"{lr['output_tps']:.2f}"
+        row["last_req_in_tokens"] = lr["input_tokens"]
+        row["last_req_out_tokens"] = lr["output_tokens"]
+        row["last_req_in_ms"] = lr["input_ms"]
+        row["last_req_out_ms"] = lr["output_ms"]
+        row["last_req_cached_tokens"] = lr["cached_tokens"]
+        row["last_req_duration_ms"] = lr["duration_ms"]
+    else:
+        row.update({k: "" for k in ("last_req_id", "last_req_in_tps", "last_req_out_tps",
+                                    "last_req_in_tokens", "last_req_out_tokens",
+                                    "last_req_cached_tokens", "last_req_in_ms",
+                                    "last_req_out_ms", "last_req_duration_ms")})
+    return row
 
 
 # ── zero-aware stats & live terminal plot ───────────────────────────
@@ -161,7 +189,11 @@ def _term_size():
         return collections.namedtuple("size", "columns lines")(100, 30)
 
 
-def _sparkline(vals, columns):
+def _sparkline(vals, columns, skip_zero=False):
+    if not vals:
+        return ""
+    if skip_zero:
+        vals = [v for v in vals if v != 0]
     if not vals:
         return ""
     step = max(1, len(vals) / max(1, columns))
@@ -186,9 +218,13 @@ def _plot_lines_plotext(series, width, height):
         fig.clear()
         fig.theme("colorless")
         fig.plot_size(width, height)
-        for name, pts in pairs:
-            xs = [p[0] for p in pts] or [0.0]
-            ys = [p[1] for p in pts] or [0.0]
+        for name, pts, skip_zero in pairs:
+            if skip_zero:
+                pts = [p for p in pts if p[1] != 0]
+            if not pts:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
             sig = fig.signal(xs, ys, marker="hd")
             sig.lines(True)
             if name:
@@ -199,10 +235,11 @@ def _plot_lines_plotext(series, width, height):
 
     out = []
     for caption, pairs in (
-        ("Decode (tok/s)", [("", series["decode"])]),
-        ("Prefill (tok/s)", [("", series["prefill"])]),
-        ("VRAM (GiB)", [("", series["vram"])]),
-        ("RAM avail (GiB)", [("", series["ram"])]),
+        ("Decode (tok/s)", [("", series["decode"], True)]),
+        ("Prefill (tok/s)", [("", series["prefill"], True)]),
+        ("Input (tok/s)", [("", series["input"], True)]),
+        ("VRAM (GiB)", [("", series["vram"], True)]),
+        ("RAM avail (GiB)", [("", series["ram"], False)]),
     ):
         out.append(f"  {caption}")
         out += panel(pairs)
@@ -213,10 +250,11 @@ def _plot_lines_plotext(series, width, height):
 
 
 def _plot_lines_fallback(series):
-    rows = [("Decode", "decode"), ("Prefill", "prefill"), ("VRAM", "vram"), ("RAM", "ram")]
+    rows = [("Decode", "decode", True), ("Prefill", "prefill", True),
+            ("Input", "input", True), ("VRAM", "vram", True), ("RAM", "ram", False)]
     return [
-        f"  {name:<7}{_sparkline([v for _, v in series[key]], 80)}"
-        for name, key in rows
+        f"  {name:<7}{_sparkline([v for _, v in series[key]], 80, skip_zero)}"
+        for name, key, skip_zero in rows
     ]
 
 
@@ -236,19 +274,20 @@ def _plot_lines(hist, plot_h):
     # so the x axes stay aligned without forcing xlim (which crashes plotext 6 when
     # a series collapses to a single point inside a wide window).
     win = list(itertools.islice(hist, max(0, len(hist) - PLOT_HISTORY), None))
-    _, dt, pt, vram, ram = zip(*win)
+    _, dt, pt, it, vram, ram = zip(*win)
     idx = list(range(len(win)))
     series = {
         "decode": list(zip(idx, dt)),
         "prefill": list(zip(idx, pt)),
+        "input": list(zip(idx, it)),
         "vram": list(zip(idx, vram)),
         "ram": list(zip(idx, ram)),
     }
 
-    if plotext is not None and plot_h >= 15:
+    if plotext is not None and plot_h >= 18:
         ts = _term_size()
         width = max(40, min(ts.columns - 2, 160))
-        height = min(12, max(4, (plot_h - 4) // 4))
+        height = min(12, max(4, (plot_h - 5) // 5))
         return _plot_lines_plotext(series, width, height)
     return _plot_lines_fallback(series)
 
@@ -273,16 +312,44 @@ def poll(args):
         prev_zero = False  # previous fetched sample was a full-zero idle sample
         window = collections.deque(maxlen=int(WINDOW / POLL_INTERVAL))
         plot_hist = collections.deque(maxlen=PLOT_MAX_RAW)
-        ema = {"decode": 0.0, "prefill": 0.0, "vram": 0.0, "ram": 0.0}
+        ema = {"decode": 0.0, "prefill": 0.0, "input": 0.0, "vram": 0.0, "ram": 0.0}
         last10 = collections.deque(maxlen=10)
         all_dt = []
         all_pt = []
+        all_it = []
         last_plot_lines = []
+        # Per-request recap: key every finished request by (instance_id, uid) so a request
+        # whose /v1/stats the poller sees more than once is counted exactly once. The
+        # aggregate is a duration-weighted average (llama.cpp server_metrics style): sum of
+        # tokens over sum of phase times, so a request's contribution scales with how long
+        # its input/output phases actually ran. Input tokens = prompt minus cache hits;
+        # output tokens = n_gen - 1 (the first token rides the prompt batch's logits).
+        last_req_key = None
+        req_n = 0
+        req_in_proc = 0          # sum of (input_tokens - cached_tokens)
+        req_out_eff = 0          # sum of max(0, output_tokens - 1)
+        req_in_ms = 0            # sum of input_ms
+        req_out_ms = 0           # sum of output_ms
+        cur_req = None
         try:
             while True:
                 d = fetch_stats()
                 if d:
                     row = row_from_stats(d)
+                    # Per-request recaps: key each finished request by (instance_id, uid) so
+                    # the same request seen across polls is counted exactly once.
+                    lr = (d.get("requests") or {}).get("last_request")
+                    inst = d.get("instance_id")
+                    if lr:
+                        key = (inst, lr["id"])
+                        if key != last_req_key:
+                            last_req_key = key
+                            req_n += 1
+                            req_in_proc += max(0, lr["input_tokens"] - lr["cached_tokens"])
+                            req_out_eff += max(0, lr["output_tokens"] - 1)
+                            req_in_ms += lr["input_ms"]
+                            req_out_ms += lr["output_ms"]
+                        cur_req = lr
                     is_zero = _is_full_zero_row(row)
                     if not (is_zero and prev_zero):
                         writer.writerow(row)
@@ -292,49 +359,63 @@ def poll(args):
                     seen += 1
                     dt = float(row["decode_tps"])
                     pt = float(row["prefill_tps"])
+                    it = float(row["input_tps"])
                     vram = int(row["vram_bytes"]) / 1024**3
                     ram = int(row["ram_available_bytes"]) / 1024**3
 
                     all_dt.append(dt)
                     all_pt.append(pt)
-                    window.append((dt, pt, vram, ram))
-                    plot_hist.append((time.monotonic() - t0, dt, pt, vram, ram))
+                    all_it.append(it)
+                    window.append((dt, pt, it, vram, ram))
+                    plot_hist.append((time.monotonic() - t0, dt, pt, it, vram, ram))
+                    # recap of the last completed request (id + its averages), filled in
+                    # once that request finishes; empty until the first completion.
+                    lrid = str(lr["id"]) if lr else ""
+                    rin = lr["input_tps"] if lr else 0.0
+                    rout = lr["output_tps"] if lr else 0.0
+                    rec = (seen, dt, pt, it, vram, ram, lrid, rin, rout)
                     if is_zero and last10:
                         # Slide the index forward but keep the idle sample's real values,
                         # so the row doesn't report the last prefill burst as current.
-                        last10[-1] = (seen, dt, pt, vram, ram)
+                        prev = last10[-1]
+                        last10[-1] = (seen, prev[1], prev[2], prev[3], prev[4], prev[5],
+                                      prev[6], prev[7], prev[8])
                     else:
-                        last10.append((seen, dt, pt, vram, ram))
+                        last10.append(rec)
 
-                    for k, v in [("decode", dt), ("prefill", pt), ("vram", vram), ("ram", ram)]:
+                    for k, v in [("decode", dt), ("prefill", pt), ("input", it),
+                                 ("vram", vram), ("ram", ram)]:
                         if v != 0:
                             ema[k] = EMA_ALPHA * v + (1 - EMA_ALPHA) * ema[k] if ema[k] else v
 
                     s_dt = _stats(all_dt)
                     s_pt = _stats(all_pt)
+                    s_it = _stats(all_it)
 
                     w_dt = _window_mean(window, 0)
                     w_pt = _window_mean(window, 1)
-                    w_vram = _window_mean(window, 2)
-                    w_ram = _window_mean(window, 3)
+                    w_it = _window_mean(window, 2)
+                    w_vram = _window_mean(window, 3)
+                    w_ram = _window_mean(window, 4)
                     wm_dt = _median([x[0] for x in window])
                     wm_pt = _median([x[1] for x in window])
-                    wm_vram = _median([x[2] for x in window])
-                    wm_ram = _median([x[3] for x in window])
+                    wm_it = _median([x[2] for x in window])
+                    wm_vram = _median([x[3] for x in window])
+                    wm_ram = _median([x[4] for x in window])
 
                     if show_plot:
                         L = _term_size().lines
-                        if L >= 41:
-                            h = min(12, (L - 29) // 4)
-                            plot_lines = _plot_lines(plot_hist, 4 + 4 * h)
+                        if L >= 44:
+                            h = min(12, (L - 36) // 5)
+                            plot_lines = _plot_lines(plot_hist, 5 + 5 * h)
                             show_last10 = True
-                        elif L >= 28:
-                            h = min(12, (L - 16) // 4)
-                            plot_lines = _plot_lines(plot_hist, 4 + 4 * h)
+                        elif L >= 30:
+                            h = min(12, (L - 20) // 5)
+                            plot_lines = _plot_lines(plot_hist, 5 + 5 * h)
                             show_last10 = False
                         else:
                             plot_lines = _plot_lines(plot_hist, 0)
-                            show_last10 = 28 <= L
+                            show_last10 = 30 <= L
                     else:
                         plot_lines = []
                         show_last10 = True
@@ -352,47 +433,84 @@ def poll(args):
                     if show_last10:
                         lines.append(
                             f"  {'#':>5}  {'Decode':>7}  {'Prefill':>7}  "
-                            f"{'VRAM':>6}  {'RAM avail':>10}"
+                            f"{'Input':>7}  {'VRAM':>6}  {'RAM avail':>10}  "
+                            f"{'REQ':>5}  {'in-avg':>7}  {'out-avg':>7}"
                         )
-                        lines.append(f"  {'─'*45}")
-                        for row_n, rdt, rpt, rvram, rram in last10:
+                        lines.append(f"  {'─'*76}")
+                        for row in last10:
+                            row_n, rdt, rpt, rit, rvram, rram, lrid, rin, rout = row
                             lines.append(
                                 f"  {row_n:>5}  {rdt:6.1f}t  {rpt:6.0f}t  "
-                                f"{rvram:5.1f}G  {rram:5.1f}G"
+                                f"{rit:6.0f}t  {rvram:5.1f}G  {rram:5.1f}G  "
+                                f"{lrid:>5}  {rin:6.1f}t  {rout:6.1f}t"
                             )
-                        lines.append(f"  {'─'*45}")
+                        lines.append(f"  {'─'*76}")
 
                     mn_dt, mean_dt, trim_dt, med_dt, std_dt, mx_dt = s_dt
                     mn_pt, mean_pt, trim_pt, med_pt, std_pt, mx_pt = s_pt
+                    mn_it, mean_it, _, med_it, _, mx_it = s_it
                     lines.append(
-                        f"  {'AVG':<7}{mean_dt:7.1f}t  {mean_pt:7.0f}t  {'':>6}  {'':>10}"
+                        f"  {'AVG':<7}{mean_dt:7.1f}t  {mean_pt:7.0f}t  "
+                        f"{mean_it:7.0f}t  {'':>6}  {'':>10}"
                     )
                     lines.append(
-                        f"  {'TRIM':<7}{trim_dt:7.1f}t  {trim_pt:7.0f}t  {'':>6}  {'':>10}"
+                        f"  {'TRIM':<7}{trim_dt:7.1f}t  {trim_pt:7.0f}t  "
+                        f"{'':>7}  {'':>6}  {'':>10}"
                     )
                     lines.append(
-                        f"  {'':7}±{std_dt:6.1f}   ±{std_pt:6.0f}   {'':>6}  {'':>10}"
+                        f"  {'':7}±{std_dt:6.1f}   ±{std_pt:6.0f}   {'':>7}  {'':>6}  {'':>10}"
                     )
                     lines.append(
                         f"  {'':7}[{mn_dt:.1f},{mx_dt:.1f}]"
                         f"  [{mn_pt:.0f},{mx_pt:.0f}]"
+                        f"  [{mn_it:.0f},{mx_it:.0f}]"
                         f"  {'':>6}  {'':>10}"
                     )
                     lines.append(
-                        f"  {'MED':<7}{med_dt:7.1f}t  {med_pt:7.0f}t  {'':>6}  {'':>10}"
+                        f"  {'MED':<7}{med_dt:7.1f}t  {med_pt:7.0f}t  "
+                        f"{med_it:7.0f}t  {'':>6}  {'':>10}"
                     )
                     lines.append(
                         f"  {'WIN':<7}{w_dt:7.1f}t  {w_pt:7.0f}t  "
-                        f"{w_vram:6.1f}G  {w_ram:7.1f}G"
+                        f"{w_it:7.0f}t  {w_vram:6.1f}G  {w_ram:7.1f}G"
                     )
                     lines.append(
                         f"  {'WINMED':<7}{wm_dt:7.1f}t  {wm_pt:7.0f}t  "
-                        f"{wm_vram:6.1f}G  {wm_ram:7.1f}G"
+                        f"{wm_it:7.0f}t  {wm_vram:6.1f}G  {wm_ram:7.1f}G"
                     )
                     lines.append(
                         f"  {'EMA':<7}{ema['decode']:7.1f}t  {ema['prefill']:7.0f}t  "
-                        f"{ema['vram']:6.1f}G  {ema['ram']:7.1f}G"
+                        f"{ema['input']:7.0f}t  {ema['vram']:6.1f}G  {ema['ram']:7.1f}G"
                     )
+
+                    if cur_req is not None:
+                        lines.append(
+                            f"  LAST REQ  #{cur_req['id']}"
+                            f"  in {cur_req['input_tokens']} tok"
+                            f" @{cur_req['input_tps']:.1f}/s"
+                            f"  out {cur_req['output_tokens']} tok"
+                            f" @{cur_req['output_tps']:.1f}/s"
+                            f"  {cur_req['duration_ms'] / 1e3:.1f}s"
+                        )
+                    if req_n:
+                        # Duration-weighted aggregate: tokens/time. Combined weight uses the
+                        # sum of both phase times (input+output) as the requested denominator.
+                        in_s = req_in_ms / 1e3
+                        out_s = req_out_ms / 1e3
+                        w_in = req_in_proc / in_s if in_s > 0 else 0.0
+                        w_out = req_out_eff / out_s if out_s > 0 else 0.0
+                        both_s = in_s + out_s
+                        w_both = (req_in_proc + req_out_eff) / both_s if both_s > 0 else 0.0
+                        lines.append(
+                            f"  REQS      {req_n}  w-avg in {w_in:6.1f}/s"
+                            f"  w-avg out {w_out:6.1f}/s"
+                            f"  w-avg all {w_both:6.1f}/s"
+                        )
+                        lines.append(
+                            f"  {'':8}in {req_in_proc} proc tok"
+                            f"  out {req_out_eff} tok"
+                            f"  in {in_s:.1f}s / out {out_s:.1f}s"
+                        )
 
                     print("\033[2J\033[H" + "\n".join(lines), flush=True)
                 else:
@@ -436,6 +554,7 @@ def view(args):
     metrics = {
         "decode_tps": ("Decode tok/s", float),
         "prefill_tps": ("Prefill tok/s", float),
+        "input_tps": ("Input tok/s", float),
         "vram_bytes": ("VRAM GiB", lambda v: int(v) / 1024**3),
         "ram_available_bytes": ("RAM avail GiB", lambda v: int(v) / 1024**3),
         "ttft_mean_ms": ("TTFT ms", float),
@@ -458,7 +577,10 @@ def view(args):
     print(f"  {'─'*80}")
 
     for key, (label, conv) in metrics.items():
-        vals = sorted(v for v in (conv(r[key]) for r in active_rows) if v != 0)
+        raw = [conv(r.get(key, 0)) for r in active_rows]
+        # Skip zeros for everything except RAM: 0 tok/s is idle noise, but 0 avail RAM is a
+        # genuine reading that belongs in min (the per-row read is never a 0 on a live host).
+        vals = sorted(v for v in raw if v != 0) if key != "ram_available_bytes" else sorted(raw)
         n = len(vals)
         if n == 0:
             print(f"  {label:<18} {'0.0':>10} {'0.0':>10} {'0.0':>10} {'0.0':>10} "
@@ -494,6 +616,37 @@ def view(args):
     )
     print(f"{'─'*60}")
 
+    # ── per-request recap aggregates (filled in once each request completed) ──
+    recaps = {}  # last_req_id -> first row carrying that request's recap
+    for r in rows:
+        rid = r.get("last_req_id", "")
+        if rid and rid not in recaps:
+            recaps[rid] = r
+    if recaps:
+        n_req = len(recaps)
+        in_proc = sum(max(0, int(x["last_req_in_tokens"]) - int(x["last_req_cached_tokens"]))
+                      for x in recaps.values())
+        out_eff = sum(max(0, int(x["last_req_out_tokens"]) - 1) for x in recaps.values())
+        in_ms = sum(int(x["last_req_in_ms"]) for x in recaps.values())
+        out_ms = sum(int(x["last_req_out_ms"]) for x in recaps.values())
+        in_s, out_s = in_ms / 1e3, out_ms / 1e3
+        w_in = in_proc / in_s if in_s else 0.0
+        w_out = out_eff / out_s if out_s else 0.0
+        both_s = in_s + out_s
+        w_both = (in_proc + out_eff) / both_s if both_s else 0.0
+        print(f"  {'─'*70}")
+        print(
+            f"  Requests:      {n_req}   "
+            f"w-avg in {w_in:.1f}/s   w-avg out {w_out:.1f}/s   w-avg all {w_both:.1f}/s"
+        )
+        print(
+            f"  {'':>14}in {in_proc} proc tok   out {out_eff} tok"
+            f"   in {in_s:.1f}s / out {out_s:.1f}s"
+        )
+        print(f"  {'─'*70}")
+    else:
+        print(f"  (no per-request recap data in this CSV; regenerate with the current monitor)")
+
     # ── plot ─────────────────────────────────────────────────────────
     try:
         import matplotlib
@@ -510,10 +663,11 @@ def view(args):
     xs = [(datetime.fromisoformat(r["timestamp"]) - t0).total_seconds() for r in active_rows]
     decode = [float(r["decode_tps"]) for r in active_rows]
     prefill = [float(r["prefill_tps"]) for r in active_rows]
+    input_ = [float(r.get("input_tps", 0)) for r in active_rows]
     vram = [int(r["vram_bytes"]) / 1024**3 for r in active_rows]
     ram = [int(r["ram_available_bytes"]) / 1024**3 for r in active_rows]
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 8), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 10), sharex=True)
     fig.suptitle(f"FreeToken Monitor — {path.stem}", fontsize=13)
 
     # decode throughput
@@ -530,14 +684,21 @@ def view(args):
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # VRAM
+    # input throughput (scheduler-measured prefill rate)
     ax = axes[2]
+    ax.plot(xs, input_, linewidth=1, label="Input", color="#7c3aed")
+    ax.set_ylabel("Input (tok/s)")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # VRAM
+    ax = axes[3]
     ax.plot(xs, vram, linewidth=1, color="#dc2626")
     ax.set_ylabel("VRAM (GiB)")
     ax.grid(True, alpha=0.3)
 
     # RAM
-    ax = axes[3]
+    ax = axes[4]
     ax.plot(xs, ram, linewidth=1, color="#16a34a")
     ax.set_ylabel("RAM avail (GiB)")
     ax.set_xlabel("Time (s)")
