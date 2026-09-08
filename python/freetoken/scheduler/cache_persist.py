@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Iterator, List, Tuple
 import numpy as np
 import torch
 from freetoken.utils import align_down, init_logger
+from freetoken.utils.progress import byte_bar
 
 if TYPE_CHECKING:
     from freetoken.kvcache.linear_state_pool import LinearStatePool
@@ -201,6 +202,14 @@ class CachePersister:
 
         d = self._snapshot_dir()
         os.makedirs(d, exist_ok=True)
+        logger.info_rank0(
+            "kv-persist: writing snapshot of %d tokens (%d KV pages, %.3f GiB, %d GDN slots) to %s",
+            sum(n.length for n in nodes),
+            len(unique_pages),
+            est_total / (1 << 30),
+            len(unique_slots),
+            d,
+        )
         tmp_kv, tmp_gdn, tmp_tree, tmp_meta = (
             os.path.join(d, n)
             for n in ("kv.bin.tmp", "gdn.bin.tmp", "tree.json.tmp", "meta.json.tmp")
@@ -208,15 +217,19 @@ class CachePersister:
         try:
             buf = self._kv_pool._kv_buffer  # (2, L, P, ps, H, D)
             with open(tmp_kv, "wb") as f:
-                for r0, r1 in _page_runs(unique_pages):
-                    # Reorder each run to per-page slabs (nrun, 2, L, ps, H, D) so a node's
-                    # bytes sit at page_pos[first_page] * page_bytes, matching kv_off.
-                    run = buf[:, :, r0 : r1 + 1].permute(2, 0, 1, 3, 4, 5)
-                    f.write(_cpu_bytes(run))
-            if gdn_layout is not None:
+                with byte_bar(kv_total, "kv-persist kv.bin") as pbar:
+                    for r0, r1 in _page_runs(unique_pages):
+                        # Reorder each run to per-page slabs (nrun, 2, L, ps, H, D) so a node's
+                        # bytes sit at page_pos[first_page] * page_bytes, matching kv_off.
+                        run = buf[:, :, r0 : r1 + 1].permute(2, 0, 1, 3, 4, 5)
+                        f.write(_cpu_bytes(run))
+                        pbar.update((r1 - r0 + 1) * page_bytes)
+            if gdn_layout is not None and unique_slots:
                 with open(tmp_gdn, "wb") as f:
-                    for slot in unique_slots:
-                        f.write(_gdn_slot_bytes(self._lsp, slot))
+                    with byte_bar(gdn_total, "kv-persist gdn.bin") as pbar:
+                        for slot in unique_slots:
+                            f.write(_gdn_slot_bytes(self._lsp, slot))
+                            pbar.update(slot_bytes)
             records = []
             for node in nodes:
                 p0 = int(node.value[0]) // cm.page_size
