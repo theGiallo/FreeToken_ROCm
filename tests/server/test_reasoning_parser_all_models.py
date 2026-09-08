@@ -162,6 +162,61 @@ def test_think_streaming_tool_call_after_close_routes_to_content():
     assert reasoning.startswith("I need to provide")
 
 
+# ------------------------------------------------ qwen3.6 short-markers family
+def test_qwen36_short_response_marker_ends_reasoning():
+    # Qwen3.6 "thinking-official" closes its reasoning with the single 8-byte BPE
+    # control token (ids 248068/248069, hex 3c/2f/.../3e) instead of the 10/11-byte
+    # <thinking>/</thinking> tags. The token decodes to the " response" spelling
+    # (letters t-h-i-n-k, no "ing"), so `_first_marker` on the long markers never
+    # matches and reasoning leaks. The short marker must end reasoning and the rest
+    # must land in content.
+    response_marker = bytes.fromhex("3c2f7468696e6b3e").decode("ascii")
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream("reason here" + response_marker + "the answer")
+    assert reasoning == "reason here"
+    assert content == "the answer"
+    assert response_marker not in reasoning + content
+
+
+def test_qwen36_short_response_marker_before_tool_block():
+    # The live reproduction: reasoning text, `\n`, the 8-byte closer, `\n\n`, then a
+    # Qwen tool-CSL block. Without the short-marker closer the block held in the
+    # buffer flushed to reasoning; now reasoning ends at the marker and the tool
+    # block stays in content for the tool-call parser.
+    response_marker = bytes.fromhex("3c2f7468696e6b3e").decode("ascii")
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = _stream(
+        parser,
+        [
+            "The user says continue.\n",
+            response_marker,
+            "\n\n",
+            "<tool_call>",
+            "\n<function=get_weather>",
+            "\n<parameter=city>\nParis\n</parameter>",
+            "\n</tool_call>",
+        ],
+    )
+    assert reasoning.strip() == "The user says continue."
+    assert content.startswith("\n\n<tool_call>")
+    assert "<function=get_weather>" in content
+    assert response_marker not in reasoning + content
+
+
+def test_qwen36_short_response_marker_split_across_chunks():
+    # Streaming reassembly: the 8-byte closer split mid-token must still be held and
+    # reassembled, not streamed out as reasoning.
+    response_marker = bytes.fromhex("3c2f7468696e6b3e").decode("ascii")
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = _stream(
+        parser,
+        ["reason", response_marker[:5], response_marker[5:], "\nanswer text"],
+    )
+    assert reasoning.strip() == "reason"
+    assert content.strip() == "answer text"
+    assert response_marker not in reasoning + content
+
+
 # ------------------------------------------------- think-alias blocks
 def test_think_alias_non_stream_after_primary_close_routes_to_reasoning():
     # Qwen3.6 wraps a stray "thought" section in this alias pair in addition to
@@ -282,6 +337,67 @@ def test_think_answer_boundary_before_tool_call_takes_precedence():
 
 
 # --------------------------------------------------- answer envelope stripping
+def test_think_short_answer_envelope_stripped_from_content():
+    # The live qwen3.6-35b-a3b-256k "thinking-official" checkpoint wraps its answer
+    # in the SHORT <answer>/</answer> single-BPE pair (not <answer_prompt>), and the
+    # parser must strip it the same way or the raw tags leak into the visible answer.
+    answer_start = bytes.fromhex("3c616e737765723e").decode("ascii")
+    answer_end = bytes.fromhex("3c2f616e737765723e").decode("ascii")
+    short_resp = bytes.fromhex("3c2f7468696e6b3e").decode("ascii")
+    text = (
+        "Let me verify the spawn position.\n"
+        + short_resp
+        + "\n"
+        + answer_start
+        + "\nLet me check the current state of the spawn logic and rendering.\n"
+        + answer_end
+    )
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(text)
+    assert reasoning == "Let me verify the spawn position."
+    assert content == "Let me check the current state of the spawn logic and rendering."
+    assert answer_start not in reasoning + content
+    assert answer_end not in reasoning + content
+
+
+def test_think_short_answer_opener_alone_closes_reasoning():
+    # When the model skips the closer entirely and jumps straight into the short
+    # <answer> envelope, the opener must end reasoning by itself (mirror of the
+    # <answer_prompt> boundary test).
+    answer_start = bytes.fromhex("3c616e737765723e").decode("ascii")
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    reasoning, content = parser.parse_non_stream(
+        "weigh the options\n" + answer_start + "\nThe answer text."
+    )
+    assert reasoning == "weigh the options"
+    assert content == "The answer text."
+
+
+def test_think_short_answer_envelope_streaming_split_across_chunks():
+    # Streaming variant with the answer envelope markers split at arbitrary chunk
+    # boundaries; the enum holds the partial tags until they can be stripped whole.
+    answer_start = bytes.fromhex("3c616e737765723e").decode("ascii")
+    answer_end = bytes.fromhex("3c2f616e737765723e").decode("ascii")
+    short_resp = bytes.fromhex("3c2f7468696e6b3e").decode("ascii")
+    reasoning, content = _stream(
+        parser := ReasoningParser("qwen3", force_reasoning=True),
+        [
+            "The user says continue.\n",
+            short_resp,
+            "\n",
+            answer_start[:4],
+            answer_start[4:],
+            "\nThe answer.",
+            "\n",
+            answer_end[:5],
+            answer_end[5:],
+        ],
+    )
+    assert reasoning.strip() == "The user says continue."
+    assert content.strip() == "The answer."
+    assert "<" not in content
+
+
 def test_think_answer_envelope_stripped_from_content():
     # The qwen3.6 "thinking-official" fine-tune wraps its answer in an
     # <answer_prompt> envelope and emits an empty <function_call> placeholder when

@@ -38,6 +38,22 @@ THINK_END_TOKEN = "</thinking>"
 # the visible answer.
 THOUGHT_START_TOKEN = "<thought>"
 THOUGHT_END_TOKEN = "</thought>"
+
+# Qwen3.6 "thinking-official" checkpoints emit their reasoning markers as two
+# single BPE control tokens (ids 248068 / 248069) that decode to the 7- and
+# 8-byte spellings below -- NOT the 10/11-byte <thinking>/</thinking> the other
+# Qwen3.x checkpoints use. The short pair is a strict subset (the "ing" is
+# missing), so `_first_marker` on the long strings never matches it and reasoning
+# never closes. Built from hex because the literal spelling is unprintable in
+# this source file.
+QWEN_SHORT_THINK_START_TOKEN = bytes.fromhex("3c7468696e6b3e").decode("ascii")
+QWEN_SHORT_THINK_END_TOKEN = bytes.fromhex("3c2f7468696e6b3e").decode("ascii")
+# Qwen3.6 "thinking-official" also wraps its visible answer in the short
+# `<answer>`/`</answer>` pair (ids 248070 / 248071), NOT the long
+# `<answer_prompt>`/`</answer_prompt>` the other qwen3.x checkpoints use. Built
+# from hex for the same unprintable-spelling reason as the short think markers.
+QWEN_SHORT_ANSWER_START_TOKEN = bytes.fromhex("3c616e737765723e").decode("ascii")
+QWEN_SHORT_ANSWER_END_TOKEN = bytes.fromhex("3c2f616e737765723e").decode("ascii")
 DSML_TOKEN = "｜DSML｜"
 
 # The qwen3 provider's fine-tune sometimes ends its reasoning block with the
@@ -51,7 +67,11 @@ ANSWER_PROMPT_TOKEN = "<answer_prompt>"
 # and emits an empty <function_call>...</function_call> placeholder when declining
 # its tool list. The envelope is framing, not output: the parser strips it from
 # content, but a NON-empty <function_call> block survives for the tool parser.
+# The short <answer>/</answer> pair is the same envelope on the 230B checkpoint
+# (single BPE tokens), so both lengths are stripped and held identically.
 ANSWER_ENVELOPE_TOKENS = (
+    QWEN_SHORT_ANSWER_START_TOKEN,
+    QWEN_SHORT_ANSWER_END_TOKEN,
     ANSWER_PROMPT_TOKEN,
     "</answer_prompt>",
     "<function_call>",
@@ -154,6 +174,8 @@ class BaseReasoningParser:
         tool_start_token: Optional[str] = None,
         alt_start_token: Optional[str] = None,
         alt_end_token: Optional[str] = None,
+        extra_start_tokens: Optional[Sequence[str]] = None,
+        extra_end_tokens: Optional[Sequence[str]] = None,
         answer_boundary_tokens: Optional[Sequence[str]] = None,
         content_strip_tokens: Optional[Sequence[str]] = None,
         content_strip_re: Optional[re.Pattern] = None,
@@ -164,6 +186,8 @@ class BaseReasoningParser:
         self.tool_start_token = tool_start_token
         self.alt_start_token = alt_start_token
         self.alt_end_token = alt_end_token
+        self._extra_start_tokens = list(extra_start_tokens or ())
+        self._extra_end_tokens = list(extra_end_tokens or ())
         self.answer_boundary_tokens = list(answer_boundary_tokens or ())
         self._answer_boundary_res = [
             re.compile(r"(?m)^[ \t]*" + re.escape(token.lstrip()))
@@ -189,11 +213,11 @@ class BaseReasoningParser:
 
     @property
     def _openers(self) -> List[str]:
-        return [t for t in (self.think_start_token, self.alt_start_token) if t]
+        return [t for t in (self.think_start_token, self.alt_start_token) if t] + self._extra_start_tokens
 
     @property
     def _closers(self) -> List[str]:
-        return [t for t in (self.think_end_token, self.alt_end_token) if t]
+        return [t for t in (self.think_end_token, self.alt_end_token) if t] + self._extra_end_tokens
 
     def _reasoning_end(self, text: str) -> Optional[Tuple[int, int]]:
         """Earliest ``(start, end)`` of a reasoning-end marker in ``text``: a
@@ -667,8 +691,19 @@ class ThinkReasoningParser(BaseReasoningParser):
             tool_start_token="<tool_call>",
             alt_start_token=THOUGHT_START_TOKEN,
             alt_end_token=THOUGHT_END_TOKEN,
-            answer_boundary_tokens=[ANSWER_BOUNDARY_TOKEN, ANSWER_PROMPT_TOKEN],
-            content_strip_tokens=(ANSWER_PROMPT_TOKEN, "</answer_prompt>"),
+            extra_start_tokens=(QWEN_SHORT_THINK_START_TOKEN,),
+            extra_end_tokens=(QWEN_SHORT_THINK_END_TOKEN,),
+            answer_boundary_tokens=[
+                ANSWER_BOUNDARY_TOKEN,
+                ANSWER_PROMPT_TOKEN,
+                QWEN_SHORT_ANSWER_START_TOKEN,
+            ],
+            content_strip_tokens=(
+                QWEN_SHORT_ANSWER_START_TOKEN,
+                QWEN_SHORT_ANSWER_END_TOKEN,
+                ANSWER_PROMPT_TOKEN,
+                "</answer_prompt>",
+            ),
             content_strip_re=EMPTY_FUNCTION_CALL_RE,
             hold_tokens=ANSWER_ENVELOPE_TOKENS,
         )
