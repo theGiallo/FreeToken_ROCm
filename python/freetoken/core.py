@@ -63,6 +63,12 @@ class Req:
     mamba_ping_pong: tuple[int, int] | None = None  # 2 donatable track slots under overlap
     mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
+    # gdn_message_boundary_snapshots: donor boundary cap = the token offset of this request's
+    # last stable message boundary (the last `<|im_start|>assistant` header). _build_track_metadata
+    # clamps its deepest-chunk-boundary pick to at-or-below here, so a continuation that
+    # re-renders the trailing assistant answer (diverging before the chunk-est boundary) reuses
+    # the shared prefix. None = disabled or no message boundary this prompt.
+    mamba_msg_boundary: int | None = None
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)

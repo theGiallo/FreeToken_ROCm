@@ -26,6 +26,12 @@ class SchedulerConfig(EngineConfig):
     kv_persist_dir: str | None = None
     kv_persist_max_gb: int | None = None
     kv_persist_max_age_h: float | None = None
+    # Hybrid GDN only: donate each request's single prefill snapshot at the deepest
+    # message-boundary-aligned (>cached_len) boundary instead of the deepest chunk boundary.
+    # A continuation re-renders the trailing assistant answer and diverges a few tokens BEFORE
+    # the deepest boundary; a snapshot at-or-below the last `<|im_start|>assistant` header is on
+    # the shared prefix, so the appended user turn reuses it instead of re-prefilling cold.
+    gdn_message_boundary_snapshots: bool = False
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

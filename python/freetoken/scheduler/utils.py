@@ -18,6 +18,9 @@ class PendingReq:
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
+    # gdn_message_boundary_snapshots: donor boundary cap (see Req.mamba_msg_boundary), computed
+    # once per prompt from the input_ids; carried so every continuation chunk inherits it.
+    mamba_msg_boundary: int | None = None
 
     @property
     def input_len(self) -> int:

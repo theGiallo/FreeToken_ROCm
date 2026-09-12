@@ -259,6 +259,35 @@ def _port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _kill_stale_server(port: int):
+    """Kill whatever ft serve already listens on port; the harness must own it."""
+    pids = set()
+    try:
+        out = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        if f"127.0.0.1:{port}" not in line:
+            continue
+        m = re.search(r"pid=(\d+)", line)
+        if m:
+            pids.add(int(m.group(1)))
+    for pid in pids:
+        try:
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").replace("\0", " ")
+        except OSError:
+            continue
+        if "serve" not in cmd or "ft" not in cmd:
+            print(f"  ! port {port} is held by non-ft pid {pid}: {cmd[:120]}")
+            continue
+        print(f"  killing stale ft serve pid {pid}")
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            if not _port_in_use(port):
+                break
+            time.sleep(0.2)
+
+
 def http_json(method: str, path: str, body=None, timeout: float = 30.0):
     url = f"http://127.0.0.1:{PORT}{path}"
     data = json.dumps(body).encode() if body is not None else None
@@ -298,8 +327,12 @@ class Server:
     def __init__(self, args: list[str], log: str, timeout: float):
         self.log = log
         self.timeout = timeout
+        _kill_stale_server(PORT)
         self.proc = subprocess.Popen(args, stdout=open(log, "wb"), stderr=subprocess.STDOUT,
                                      start_new_session=True)
+
+    def is_alive(self) -> bool:
+        return self.proc.poll() is None
 
     def tail(self, since: float) -> str:
         try:
@@ -422,6 +455,94 @@ def sse_times(payload: dict) -> tuple[float | None, float | None, dict, str | No
     return first, last, usage, finish_reason, t_send
 
 
+def _log_new_cached(log: str, since: float) -> tuple[int, int]:
+    """Sum #new-token/#cached-token over Prefill batch lines appended since byte pos.
+    Cold runs log one line per chunk (cached 0); a radix HIT logs a single line with
+    cached > 0. Sums isolate the request that ran after `since`."""
+    try:
+        with open(log, "rb") as fh:
+            fh.seek(since)
+            text = fh.read().decode(errors="replace")
+    except OSError:
+        return 0, 0
+    new = cached = 0
+    for line in text.splitlines():
+        if "Prefill batch" not in line or "#new-token:" not in line:
+            continue
+        m = re.search(r"#new-token: (\d+), #cached-token: (\d+)", line)
+        if m:
+            new += int(m.group(1))
+            cached += int(m.group(2))
+    return new, cached
+
+
+def run_verify_gdn(server, log: str, model_id: str, args, msgs: list[dict]) -> int:
+    """Replay the steer2/steer3 snapshot sequence against one fresh server and report
+    radix reuse per step. Baselines: base COLD (one snapshot at the final chunk's deepest
+    x64 boundary), base+user MISS (qwen last-query flip diverges before the snapshot),
+    strict continuations HIT that same boundary, sentinel store + continuations HIT.
+    With --gdn-message-boundary-snapshots the donation is clamped below the trailing
+    message header, so base+user and rewind-to-base HIT the clamped boundary instead."""
+    counter = PromptCounter()
+    last_user = LAST_USER_REQUEST or "Continue the session."
+    sentinel = "[ft-gdn-sentinel] keep this marker in the stored session"
+    bounded = "--gdn-message-boundary-snapshots" in (args.serve_extra or "")
+    base = msgs
+    cont1 = base + [{"role": "user", "content": last_user}]
+    cont2 = cont1 + [{"role": "assistant", "content": "Understood, I will continue working on the game."}]
+    cont3 = cont2 + [{"role": "user", "content": "Good, and how should a player restart a round?"}]
+    sent0 = base + [{"role": "user", "content": sentinel}]
+    sc1 = sent0 + [{"role": "user", "content": last_user}]
+    sc2 = sc1 + [{"role": "assistant", "content": "Here is the continuation after the marker."}]
+    sc3 = sc2 + [{"role": "user", "content": "Please summarize the task status."}]
+    steps = [
+        ("base (ends assistant)", base, "COLD; expect a snapshot at the final chunk x64 boundary"),
+        ("base + user (cont1)", cont1,
+         "HIT" if bounded else "MISS; template flip diverges before the snapshot, 0 reuse"),
+        ("cont1 + assistant (cont2)", cont2, "HIT; strict extension reuses the deepest x64 boundary"),
+        ("cont2 + user (cont3)", cont3, "HIT; reuses the same boundary again"),
+        ("rewind to base", base,
+         "HIT" if bounded else "MISS; base is NOT on a snapshot boundary (truncation)"),
+        ("sentinel store", sent0, "COLD; session now ends user, renders stable"),
+        ("sentinel + user", sc1, "HIT; reuses the sentinel store's deepest x64 boundary"),
+        ("sentinel + u + assistant", sc2, "HIT; reuses it again"),
+        ("sentinel + u + a + user", sc3, "HIT; reuses it again"),
+    ]
+    pos = os.path.getsize(log)
+    rows = []
+    print("\n---- GDN snapshot verification (fresh server) ----")
+    for label, messages, expect in steps:
+        exact = counter.count(args.model, messages)
+        if exact > args.ctx - 512:
+            print(f"  ! {label}: exact {exact:,} > ctx headroom, skipping")
+            continue
+        payload = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": args.max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        t0 = time.monotonic()
+        try:
+            first, last, usage, finish_reason, t_send = sse_times(payload)
+        except Exception as exc:
+            print(f"  {label}: FAILED {exc}")
+            print(server.tail(pos))
+            return 1
+        wall = time.monotonic() - t0
+        new, cached = _log_new_cached(log, pos)
+        pos = os.path.getsize(log)
+        prompt = usage.get("prompt_tokens", 0)
+        ttft = (first - t_send) if first is not None else 0.0
+        verdict = "HIT" if cached > 0 else "MISS"
+        print(f"  {label:34s} exact={exact:>7,} prompt={prompt:>7,} "
+              f"new={new:>6,} cached={cached:>7,} ttft={ttft:6.1f}s wall={wall:6.1f}s  {verdict}")
+        rows.append((label, exact, new, cached, verdict, expect))
+    print("\n  expected:", "\n             ".join(f"{l}: {e}" for l, _, _, _, _, e in rows))
+    return 0
+
+
 # ------------------------------------------------------------- main --------------------
 CSV_FIELDS = [
     "ctx", "rate", "slots", "kv_gi", "exp_gi", "label", "verdict", "wall_s", "req_s",
@@ -443,6 +564,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--label", default="base", help="tag for the CSV/log; e.g. base, nooverlap")
+    ap.add_argument("--verify-gdn", action="store_true",
+                    help="re-run the steer2/steer3 snapshot sequence against one fresh server")
+    ap.add_argument("--serve-extra", default="",
+                    help="extra ft serve flags appended verbatim (e.g. "
+                         "--gdn-message-boundary-snapshots)")
     args = ap.parse_args()
     PORT = args.port
     RENDEZVOUS = args.port + 1
@@ -485,12 +611,18 @@ def main() -> int:
         "--port", str(PORT),
         "--decode-log-interval", "8",
     ]
+    serve += args.serve_extra.split() if args.serve_extra else []
     print("  serve:", " ".join(serve), "\n")
 
     pos = os.path.getsize(log) if os.path.exists(log) else 0
     server = Server(serve, log, timeout=600)
     try:
         stats = wait_ready(1200)
+        if not server.is_alive():
+            raise RuntimeError(
+                f"spawned server pid {server.proc.pid} exited rc={server.proc.returncode} "
+                f"but :{PORT} answered - a stale server hijacked the port; "
+                "kill it and rerun")
     except Exception:
         print(server.tail(pos))
         raise
@@ -498,6 +630,12 @@ def main() -> int:
     start_period = server.tail(pos)
     for h in [l for l in start_period.splitlines() if "ccache-rate" in l or "moe-cache" in l or "Allocating" in l]:
         print(f"    log: {h.strip()[:200]}")
+
+    if args.verify_gdn:
+        rc = run_verify_gdn(server, log, model_id, args, msgs)
+        if not args.keep:
+            server.stop()
+        return rc
 
     payload = {
         "model": model_id,

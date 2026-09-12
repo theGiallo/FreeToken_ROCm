@@ -115,7 +115,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
             continue
         # deepest mid-chunk boundary strictly inside the extend (h has the per-chunk state;
         # the exact extend-end / aligned-final state lives in the live slot -> finish-donate).
-        c = (r.extend_len - 1) // CHUNK_SIZE
+        c = _track_chunk(r, CHUNK_SIZE)
         if c < 1:
             continue
         off = int(cu_host[i])
@@ -137,4 +137,21 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     )
 
 
-__all__ = ["FLAMetadata", "build_fla_metadata"]
+def _track_chunk(r, chunk_size: int) -> int:
+    """Deepest mid-chunk boundary (chunk units into the extend) to snapshot+dump for req ``r``.
+    ``0`` means "none usable this forward"."""
+    c = (r.extend_len - 1) // chunk_size
+    if c < 1:
+        return 0
+    if r.mamba_msg_boundary is None or r.mamba_msg_boundary <= r.cached_len:
+        return c
+    # A continuation re-renders the trailing assistant answer (the template re-emits it with a
+    # thinking prefix), so the streams diverge at the last real user turn's header; clamp the
+    # donation to the deepest boundary at-or-below it so the appended turn reuses the shared
+    # prefix. A boundary inside the first chunk (< one CHUNK past cached_len) has no usable
+    # aligned snapshot here; keep the deepest (the earlier chunk that owns it will have donated).
+    c_msg = (r.mamba_msg_boundary - r.cached_len) // chunk_size
+    return min(c, c_msg) if c_msg >= 1 else c
+
+
+__all__ = ["FLAMetadata", "build_fla_metadata", "_track_chunk"]

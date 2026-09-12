@@ -56,6 +56,47 @@ class ForwardInput(NamedTuple):
     write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
 
 
+def _last_msg_boundary_len(
+    input_ids: torch.Tensor,
+    im_start_id: int,
+    im_end_id: int,
+    user_role_id: int | None = None,
+    tool_fold_ids: list[int] | None = None,
+) -> int | None:
+    """Token offset of the LAST TOP-LEVEL USER message's header, the index up to which a
+    continuation's re-render of the trailing assistant answer shares this prompt's tokens.
+    Every request ends with the template's bare generation prompt (``<|im_start|>assistant``
+    with nothing after it), so the last ``<|im_start|>`` is NOT a cap; the cap is the
+    ``<|im_start|>`` that opens the last real user turn -- a client append re-renders every
+    message after it (the model's answer with its tool-call round), and the template's
+    terminal-answer handling re-emits that tail with a thinking prefix the stored bytes lack,
+    so the streams diverge at the START OF THE ANSWER, not at its end. A tool-result fold is
+    also ``<|im_start|>user``; it is NOT a top-level turn (it is inside the answer's tool
+    round) and is skipped when ``tool_fold_ids`` is given. The donation is clamped below the
+    returned header, so the snapshot sits on the shared prefix. When no top-level user open
+    exists (or the role/fold tokens cannot be resolved), fall back to the deepest stored
+    message header, which is safe for user-terminated prompts whose re-renders are exact
+    extensions. None when the prompt has no stored message at all."""
+    starts = (input_ids == im_start_id).nonzero()
+    ends = (input_ids == im_end_id).nonzero()
+    if starts.numel() == 0 or ends.numel() == 0:
+        return None
+    last_end = int(ends[-1].item())
+    before = starts[starts < last_end]
+    if before.numel() == 0:
+        return None
+    if user_role_id is not None:
+        for pos in torch.flip(before, dims=[0]).tolist():
+            if int(input_ids[pos + 1]) != user_role_id:
+                continue
+            if tool_fold_ids:
+                seg = input_ids[pos + 2 : pos + 2 + 1 + len(tool_fold_ids)].tolist()
+                if seg[:1] == [198] and seg[1:] == tool_fold_ids:
+                    continue  # <|im_start|>user\n<tool_response>: inside the answer's tool round
+            return pos
+    return int(before[-1].item())
+
+
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
@@ -123,6 +164,75 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
+        # gdn_message_boundary_snapshots: the last message header special token, used to cap
+        # each request's snapshot donation below the trailing assistant message -- a continued
+        # session re-renders that message (adding/changing a thinking prefix) and would
+        # otherwise diverge past the deepest boundary. None when the flag is off or the
+        # checkpoint's tokenizer has no such boundary token.
+        self.msg_boundary_token_id = None
+        self.msg_boundary_gate_id = None  # the <|im_end|> that closes the last stored message
+        self.msg_boundary_user_role_id = None
+        self.msg_boundary_tool_fold_ids = None  # token ids of <tool_response>, if resolvable
+        if config.gdn_message_boundary_snapshots:
+            # <|im_start|> is a single special token on qwen-style checkpoints. Resolve it once;
+            # None (unknown / splits into multiple ids / is the unk id) disables the mode.
+            try:
+                ids = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+            except Exception:
+                ids = None
+            if isinstance(ids, list):
+                ids = ids[0] if len(ids) == 1 else None
+            self.msg_boundary_token_id = (
+                ids
+                if isinstance(ids, int)
+                and ids >= 0
+                and ids != self.tokenizer.unk_token_id
+                else None
+            )
+            try:
+                gate_ids = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            except Exception:
+                gate_ids = None
+            if isinstance(gate_ids, list):
+                gate_ids = gate_ids[0] if len(gate_ids) == 1 else None
+            self.msg_boundary_gate_id = (
+                gate_ids
+                if isinstance(gate_ids, int)
+                and gate_ids >= 0
+                and gate_ids != self.tokenizer.unk_token_id
+                else None
+            )
+            # Role + fold tokens let the boundary land at the LAST real user turn instead of
+            # the model's answer: a continuation re-renders the answer's thinking prefix and
+            # diverges at the answer start, not its end (see _last_msg_boundary_len).
+            try:
+                user_ids = self.tokenizer.convert_tokens_to_ids("user")
+            except Exception:
+                user_ids = None
+            if isinstance(user_ids, list):
+                user_ids = user_ids[0] if len(user_ids) == 1 else None
+            self.msg_boundary_user_role_id = (
+                user_ids
+                if isinstance(user_ids, int)
+                and user_ids >= 0
+                and user_ids != self.tokenizer.unk_token_id
+                else None
+            )
+            try:
+                fold_ids = self.tokenizer.encode("<tool_response>")
+            except Exception:
+                fold_ids = None
+            if isinstance(fold_ids, int):
+                fold_ids = [fold_ids] if fold_ids >= 0 else None
+            elif isinstance(fold_ids, list) and fold_ids:
+                fold_ids = [x for x in fold_ids if isinstance(x, int) and x >= 0]
+                if not fold_ids:
+                    fold_ids = None
+            else:
+                fold_ids = None
+            # encode() (not convert_tokens_to_ids, which can collapse to one special id) yields
+            # the tokenizer's realistic split of "<tool_response>" inside a byte stream.
+            self.msg_boundary_tool_fold_ids = fold_ids
         self.toolcall_anchor_id = None
         if config.special_token_ckpt and (
             self.cache_manager.is_hybrid or self.cache_manager.is_swa
@@ -565,7 +675,22 @@ class Scheduler(SchedulerIOMixin):
             if persister is not None and persister.enabled and self._pending_rebuild is None:
                 with self.engine_stream_ctx:
                     persister.materialize(msg.input_ids, getattr(msg, "mm_embeds", None))
-            self.prefill_manager.add_one_req(msg)
+            # gdn_message_boundary_snapshots: cap the snapshot donation below the trailing
+            # assistant answer (the one a continuation re-renders). The last <|im_start|> of a
+            # stored message sits past the re-render's divergence point (the answer's thinking
+            # flip), so the cap is the last TOP-LEVEL USER turn's header; a request that ends
+            # with only the generation prompt and has no stored user turn keeps the previous
+            # fallback (deepest stored message header). None when disabled or no boundary.
+            boundary = None
+            if self.msg_boundary_token_id is not None and self.msg_boundary_gate_id is not None:
+                boundary = _last_msg_boundary_len(
+                    msg.input_ids,
+                    self.msg_boundary_token_id,
+                    self.msg_boundary_gate_id,
+                    self.msg_boundary_user_role_id,
+                    self.msg_boundary_tool_fold_ids,
+                )
+            self.prefill_manager.add_one_req(msg, mamba_msg_boundary=boundary)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)

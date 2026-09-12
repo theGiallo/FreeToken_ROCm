@@ -192,6 +192,7 @@ class PrefillAdder:
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
+        req.mamba_msg_boundary = pending_req.mamba_msg_boundary
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -243,9 +244,15 @@ class PrefillManager:
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
 
-    def add_one_req(self, req: UserMsg) -> None:
+    def add_one_req(self, req: UserMsg, *, mamba_msg_boundary: int | None = None) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                mamba_msg_boundary=mamba_msg_boundary,
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
