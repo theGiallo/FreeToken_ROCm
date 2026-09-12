@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end GPU smoke test for the --kv-persist feature.
 
-Workload mirrors the pi "duck hunt" session: a long deterministic chat context (built from
-the duck_hunt workspace files, so both launches tokenize identically) is sent to a freshly
+Workload mirrors a real chat session: a long deterministic context (built from a
+--workspace directory, so both launches tokenize identically) is sent to a freshly
 started ft server. The test:
 
   1. launches ft with a budget that leaves --reserve GiB of VRAM free,
@@ -14,8 +14,8 @@ started ft server. The test:
 
 Run inside WSL against the ROCm box:
 
-  cd /mnt/f/programming/llm/FreeToken
-  $HOME/.freetoken/venv/bin/python scripts/kv_persist_smoke.py [flags]
+  cd /path/to/FreeToken
+  /path/to/venv/bin/python scripts/kv_persist_smoke.py [flags]
 
 Exit code 0 = the feature kicked in end to end; 1 = a check failed or an error occurred.
 """
@@ -32,6 +32,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -41,16 +42,18 @@ MIN_PY = (3, 10)
 if sys.version_info < MIN_PY:
     sys.exit(f"need Python {'.'.join(map(str, MIN_PY))}+")
 
-# ---- defaults matching launch_qwen35.sh / ft_serve_qwen35.sh -------------------------
-DEF_MODEL = "/home/thegiallo/models/qwen3.6-35b-a3b.gguf"
-DEF_FT = "/home/thegiallo/.freetoken/venv/bin/ft"
-DEF_DUCKDIR = "/mnt/f/programming/llm/test/qwen3.6-35b-a3b_freetoken/ctx262144/duck_hunt"
+# ---- model/tool defaults: override with flags or the FT_MODEL / FT_BIN env vars ------
+DEF_MODEL = os.environ.get("FT_MODEL", "")
+DEF_FT = os.environ.get("FT_BIN") or shutil.which("ft") or ""
+DEF_WORKSPACE = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs")
+)
 DEF_BUDGET = "21.15GiB"
 DEF_RESERVE = "3GiB"
 DEF_CTX = 262144
-DEF_KV_DIR = "/home/thegiallo/.cache/freetoken/kv_smoke"
+DEF_KV_DIR = os.path.join(os.path.expanduser("~"), ".cache", "freetoken", "kv_cache")
 
-# ---- qwen3.6-35b-a3b geometry (same constants as launch_qwen35.sh) -------------------
+# ---- geometry defaults for qwen3.6-35b-a3b offload; override for other models ---------
 TOTAL_EXPERTS = 10240
 PER_SLOT_BYTES = 1376256        # gate_up Q4_K + down Q6_K per expert slot
 KV_BYTES_PER_TOKEN = 20480      # hybrid GDN/mamba + attention state, measured
@@ -70,7 +73,7 @@ def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
 
 
 def snapshot_metas(kv_dir: str) -> list[str]:
-    return glob.glob(os.path.join(kv_dir, "qwen3.6-35b-a3b*", "meta.json"))
+    return glob.glob(os.path.join(kv_dir, "*", "meta.json"))
 
 
 def to_bytes(size: str) -> int:
@@ -119,7 +122,10 @@ def _reexec_in_wsl() -> None:
                 break
     if not wsl_exe:
         sys.exit("could not locate wsl.exe; run this script from a Windows console (Git Bash)")
-    wsl_py = "/home/thegiallo/.freetoken/venv/bin/python"
+    ft = os.environ.get("FT_BIN") or shutil.which("ft")
+    if not ft:
+        sys.exit("could not locate the ft binary; set FT_BIN or put ft on PATH")
+    wsl_py = os.path.join(os.path.dirname(ft), "python")
     script = shlex.quote(_wsl_path(os.path.abspath(sys.argv[0])))
     args = " ".join(shlex.quote(a) for a in sys.argv[1:])
     cmd = [wsl_exe, "-e", "bash", "-lc", f"exec {wsl_py} -u {script} {args}"]
@@ -214,48 +220,66 @@ class Server:
         return snapshot_metas(kv_dir)
 
 
-# ------------------------------------------------------------- duck-hunt context build
-def build_prompt(duckdir: str, target_chars: int):
-    names = ["README.md", "duck_hunt.py", "test_duck_hunt.py", "run_game.sh"]
-    files = {}
-    missing = []
-    for name in names:
-        path = os.path.join(duckdir, name)
-        if not os.path.exists(path):
-            missing.append(name)
-            continue
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            files[name] = fh.read()
-    if missing:
-        print(f"note: missing workspace files (only {sorted(files)} included): {missing}")
+# ------------------------------------------------------------- workspace context build
+def build_prompt(workspace: str, target_chars: int) -> list[dict]:
+    files: dict[str, str] = {}
+    if os.path.isdir(workspace):
+        for name in sorted(os.listdir(workspace)):
+            if name.endswith((".py", ".md", ".sh")) and os.path.isfile(
+                os.path.join(workspace, name)
+            ):
+                if len(files) >= 3:
+                    break
+                with open(
+                    os.path.join(workspace, name), encoding="utf-8", errors="replace"
+                ) as fh:
+                    files[name] = fh.read()
+    if not files:
+        print(
+            f"note: no .py/.md/.sh files in workspace {workspace!r}; "
+            "using synthetic content"
+        )
 
     turns = []
     acc = 0
     i = 0
     while acc < target_chars and files:
         i += 1
-        blob = "\n\n".join(
-            f"--- {name} (duck_hunt project) ---\n{text}" for name, text in files.items()
-        )
+        blob = "\n\n".join(f"--- {name} ---\n{text}" for name, text in files.items())
         user = (
-            f"We are building the terminal Duck Hunt game in {os.path.basename(duckdir)}. "
+            f"We are working on the project in {os.path.basename(workspace) or 'workspace'}. "
             f"Here is the current project state (iteration {i}):\n\n{blob}\n\n"
-            "Improve the game: fix anything wrong, then add polish."
+            "Improve the project: fix anything suspect, then add polish."
         )
         turns.append({"role": "user", "content": user})
         # Deterministic assistant filler so the context grows with realistic interleaving.
         filler = (
-            "I reviewed the code and will improve it: keep the curses mouse handling, "
-            "balance the round timers, and make the golden duck stand out more."
+            "I reviewed the code and will improve it: keep the existing behaviour, "
+            "tighten the logic, and make the edge cases more robust."
         )
         turns.append({"role": "assistant", "content": filler + f" (iteration {i} note)"})
         acc += len(user) + len(filler)
+    if not files:
+        for i in range(1, 101):
+            user = (
+                f"Synthetic iteration {i}: propose a one-line improvement and a short "
+                "code diff for the demo project."
+            )
+            filler = (
+                "Synthetic assistant reply: applied a small robustness improvement, "
+                f"all checks pass (iteration {i})."
+            )
+            turns.append({"role": "user", "content": user})
+            turns.append({"role": "assistant", "content": filler})
+            acc += len(user) + len(filler)
+            if acc >= target_chars:
+                break
     turns.append(
         {
             "role": "user",
             "content": (
-                "Final request: implement the bonus round and a laugh counter. Keep every "
-                "existing feature working."
+                "Final request: implement one more improvement and keep every existing "
+                "feature working."
             ),
         }
     )
@@ -331,42 +355,52 @@ def run_completion(payload: dict) -> tuple[float, dict, Sampler]:
 def main() -> int:
     global PATH_PORT
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default=DEF_MODEL)
-    ap.add_argument("--ft-bin", default=DEF_FT)
-    ap.add_argument("--duckdir", default=DEF_DUCKDIR)
+    ap.add_argument("--model", default=DEF_MODEL, help="(or set FT_MODEL)")
+    ap.add_argument("--ft-bin", default=DEF_FT, help="(or set FT_BIN)")
+    ap.add_argument("--workspace", default=DEF_WORKSPACE, help="dir whose files seed the prompt")
     ap.add_argument("--budget", default=DEF_BUDGET, help="expert+KV VRAM budget (default 21.15GiB)")
     ap.add_argument("--reserve", default=DEF_RESERVE, help="VRAM kept free after sizing (default 3GiB)")
     ap.add_argument("--ctx", type=int, default=DEF_CTX, help="--num-tokens (default 262144)")
     ap.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
-    ap.add_argument("--kv-dir", default=DEF_KV_DIR, help="dedicated snapshot dir (persistent in $HOME/.cache)")
+    ap.add_argument("--kv-dir", default=DEF_KV_DIR, help="dedicated snapshot dir (default ~/.cache/freetoken/kv_cache)")
+    ap.add_argument("--tool-call-parser", default="qwen35", help="ft --tool-call-parser")
+    ap.add_argument("--total-experts", type=int, default=TOTAL_EXPERTS)
+    ap.add_argument("--per-slot-bytes", type=int, default=PER_SLOT_BYTES)
+    ap.add_argument("--kv-bytes-per-token", type=int, default=KV_BYTES_PER_TOKEN)
+    ap.add_argument("--weights-fixed-bytes", type=int, default=WEIGHTS_FIXED)
     ap.add_argument("--port", type=int, default=1919)
     ap.add_argument("--keep", action="store_true", help="leave the final server running")
     ap.add_argument("--keep-snapshot", action="store_true", help="do not wipe the snapshot dir at start")
     args = ap.parse_args()
+    if not args.model:
+        raise SystemExit("--model is required (or set FT_MODEL)")
+    if not args.ft_bin:
+        raise SystemExit("--ft-bin is required (or set FT_BIN / put ft on PATH)")
     PATH_PORT = args.port
 
     # ---- geometry: mirror launch_qwen35.sh, reserve free VRAM after sizing ----------
     budget = to_bytes(args.budget)
     reserve = to_bytes(args.reserve)
-    avail = budget - WEIGHTS_FIXED - reserve
-    kv_needed = args.ctx * KV_BYTES_PER_TOKEN
+    avail = budget - args.weights_fixed_bytes - reserve
+    kv_needed = args.ctx * args.kv_bytes_per_token
     exp_bytes = avail - kv_needed
-    slots = max(0, min(TOTAL_EXPERTS, exp_bytes // PER_SLOT_BYTES))
-    rate = slots / TOTAL_EXPERTS
+    slots = max(0, min(args.total_experts, exp_bytes // args.per_slot_bytes))
+    rate = slots / args.total_experts
     if slots <= 0:
         raise SystemExit(
             f"geometry leaves no expert cache: budget={args.budget} reserve={args.reserve} "
             f"ctx={args.ctx}; raise --budget or lower --ctx/--reserve"
         )
     print("---- geometry ----")
-    print(f"  budget {args.budget} - fixed {WEIGHTS_FIXED / 2**30:.2f}GiB - reserve {args.reserve}")
+    print(f"  budget {args.budget} - fixed {args.weights_fixed_bytes / 2**30:.2f}GiB - reserve {args.reserve}")
     print(f"  -> {avail / 2**30:.2f}GiB for expert cache + KV; ctx {args.ctx} tok needs "
           f"{kv_needed / 2**30:.2f}GiB")
-    print(f"  moe-cache-rate {rate:.3f} ({slots}/10,240 expert slots), {reserve / 2**30:.2f}GiB kept free")
+    print(f"  moe-cache-rate {rate:.3f} ({slots}/{args.total_experts:,} expert slots), "
+          f"{reserve / 2**30:.2f}GiB kept free")
 
-    # ---- deterministic duck-hunt context -------------------------------------------
+    # ---- deterministic workspace context -------------------------------------------
     target_chars = int(args.ctx * TARGET_FRACTION * 4)  # ~0.25 tok/char heuristic
-    turns = build_prompt(args.duckdir, target_chars)
+    turns = build_prompt(args.workspace, target_chars)
     prompt_chars = sum(len(t["content"]) for t in turns)
     est_tokens = int(prompt_chars * 0.25)
     print(f"  context prompt: {len(turns)} turns, {prompt_chars:,} chars (~{est_tokens:,} tokens)")
@@ -406,7 +440,7 @@ def main() -> int:
         "--kv-reserve-tokens", str(KVRESERVE_TOKENS),
         "--moe-cache-rate", f"{rate:.4f}",
         "--num-tokens", str(args.ctx),
-        "--tool-call-parser", "qwen35",
+        "--tool-call-parser", args.tool_call_parser,
         "--enable-cache-report",
         "--kv-persist",
         "--kv-persist-dir", args.kv_dir,
@@ -416,7 +450,7 @@ def main() -> int:
     print("  serve:", " ".join(serve))
     print()
 
-    log = "/home/thegiallo/kv_persist_smoke_ft.log"
+    log = os.path.join(tempfile.gettempdir(), "kv_persist_smoke_ft.log")
     results = {}
 
     for run in (1, 2):
