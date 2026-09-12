@@ -11,7 +11,7 @@ from freetoken.distributed import DistributedInfo
 from freetoken.kvcache.linear_state_pool import LinearStatePool
 from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
-from freetoken.scheduler.cache_persist import CachePersister, default_kv_cache_dir
+from freetoken.scheduler.cache_persist import CachePersister, default_kv_cache_dir, _page_runs
 from freetoken.scheduler.config import SchedulerConfig
 
 MODEL_PATH = "/fake/model-dir/others/Danube-XYZ-4B"
@@ -216,3 +216,13 @@ def test_partial_prefix_serves_cold(tmp_path):
     cut = ids[:3]  # the parked node is 6 tokens: a 3-token prefix cannot resume it
     assert p.materialize(cut) == 0
     assert cm2.prefix_cache.match_prefix(ids).cuda_handle.cached_len == 0
+
+
+def test_page_runs_cap_splits_long_runs_and_keeps_layout():
+    pages = [1, 2, 3, 4, 5, 10, 11, 12, 20]
+    uncapped = list(_page_runs(pages))
+    assert uncapped == [(1, 5), (10, 12), (20, 20)]
+    runs = list(_page_runs(pages, max_pages=2))
+    assert runs == [(1, 2), (3, 4), (5, 5), (10, 11), (12, 12), (20, 20)]
+    flat = [p for r0, r1 in runs for p in range(r0, r1 + 1)]
+    assert flat == pages

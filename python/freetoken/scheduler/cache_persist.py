@@ -44,6 +44,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SNAPSHOT_VERSION = 1
+# Bound the GPU->CPU staging per snapshot write. A fully cached context is mostly one
+# contiguous page run; uncapped that is a multi-GiB transfer that thrashes host memory
+# on machines where the page cache is already under pressure (WSL2 big models).
+_WRITE_CHUNK_BYTES = 256 * 2**20
 # Presence marker the parent's shell-mode reap backstop polls, so it never SIGKILLs a worker
 # whose snapshot write is still in flight. Created while writing; removed on completion.
 _SAVE_MARKER_PREFIX = ".saving."
@@ -227,9 +231,10 @@ class CachePersister:
             pass
         try:
             buf = self._kv_pool._kv_buffer  # (2, L, P, ps, H, D)
+            max_span = max(1, _WRITE_CHUNK_BYTES // page_bytes)
             with open(tmp_kv, "wb") as f:
                 with byte_bar(kv_total, "kv-persist kv.bin") as pbar:
-                    for r0, r1 in _page_runs(unique_pages):
+                    for r0, r1 in _page_runs(unique_pages, max_span):
                         # Reorder each run to per-page slabs (nrun, 2, L, ps, H, D) so a node's
                         # bytes sit at page_pos[first_page] * page_bytes, matching kv_off.
                         run = buf[:, :, r0 : r1 + 1].permute(2, 0, 1, 3, 4, 5)
@@ -615,8 +620,16 @@ def _unique_pages(nodes, page_size: int) -> List[int]:
     return sorted(pages)
 
 
-def _page_runs(pages: List[int]) -> Iterator[Tuple[int, int]]:
-    """(start, end) inclusive runs of consecutive page numbers, for one big cpu copy."""
+def _page_runs(
+    pages: List[int], max_pages: int | None = None
+) -> Iterator[Tuple[int, int]]:
+    """(start, end) inclusive runs of consecutive page numbers, for one cpu copy.
+
+    Each contiguous run is staged as a single GPU->CPU transfer in save();
+    cap the span (in pages) so a fully-cached context does not stage a
+    multi-GiB copy that thrashes host memory. Sub-runs stay in page order so
+    the file layout is unchanged - every page still lands at its kv_off.
+    """
     i = 0
     while i < len(pages):
         start = pages[i]
@@ -624,7 +637,12 @@ def _page_runs(pages: List[int]) -> Iterator[Tuple[int, int]]:
         while i + 1 < len(pages) and pages[i + 1] == end + 1:
             i += 1
             end += 1
-        yield start, end
+        if max_pages and max_pages > 0:
+            while start <= end:
+                yield start, min(start + max_pages - 1, end)
+                start += max_pages
+        else:
+            yield start, end
         i += 1
 
 

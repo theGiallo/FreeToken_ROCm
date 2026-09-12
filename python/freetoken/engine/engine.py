@@ -13,6 +13,7 @@ from freetoken.distributed import destroy_distributed, enable_pynccl_distributed
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
+from freetoken.models.loader import drop_page_cache
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
@@ -645,6 +646,11 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        # The GGUF is memory-mapped for loading; every page is resident by now and nothing
+        # reads it again. Drop it instead of pinning up to ~22 GiB of file pages in host RAM
+        # right next to the (pinned) expert banks - on WSL2 that both thrashes the host and
+        # stalls the GPU<->CPU copies that a kv-persist snapshot performs at shutdown.
+        drop_page_cache(config.model_path)
         return cache
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
