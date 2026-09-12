@@ -865,6 +865,7 @@ def load_q4_0_expert_sources(
         start = time.time()
         next_log = 8
         done = 0
+        reported = 0
 
         def report(done: int) -> None:
             elapsed = time.time() - start
@@ -894,10 +895,12 @@ def load_q4_0_expert_sources(
             if tracker is not None:
                 tracker.note(layer)
             done = len(seen_gu & seen_dn)
-            if done >= next_log:
+            if done >= next_log and done > reported:
                 report(done)
+                reported = done
                 next_log = min(L, next_log + 8)
-        report(done)
+        if done != reported:
+            report(done)
 
     if layer_sink is not None:
         _load(layer_sink)
