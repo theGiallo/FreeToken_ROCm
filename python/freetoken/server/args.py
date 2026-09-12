@@ -411,7 +411,7 @@ def parse_args(
         default=ServerArgs.kv_persist_dir,
         help=(
             "Directory holding KV snapshots (one per model geometry). Default: "
-            "$XDG_CACHE_HOME/ft/KV_cache (or ~/.cache/ft/KV_cache)."
+            "$XDG_CACHE_HOME/freetoken/kv_cache (or ~/.cache/freetoken/kv_cache)."
         ),
     )
 

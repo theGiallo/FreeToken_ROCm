@@ -44,14 +44,17 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SNAPSHOT_VERSION = 1
+# Presence marker the parent's shell-mode reap backstop polls, so it never SIGKILLs a worker
+# whose snapshot write is still in flight. Created while writing; removed on completion.
+_SAVE_MARKER_PREFIX = ".saving."
 
 
 def default_kv_cache_dir() -> str:
-    """XDG-aware snapshot root; ~/.cache/ft/KV_cache when XDG_CACHE_HOME is unset."""
+    """XDG-aware snapshot root; ~/.cache/freetoken/kv_cache when XDG_CACHE_HOME is unset."""
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
         os.path.expanduser("~"), ".cache"
     )
-    return os.path.join(base, "ft", "KV_cache")
+    return os.path.join(base, "freetoken", "kv_cache")
 
 
 def _cpu_bytes(t: torch.Tensor) -> bytes:
@@ -214,6 +217,14 @@ class CachePersister:
             os.path.join(d, n)
             for n in ("kv.bin.tmp", "gdn.bin.tmp", "tree.json.tmp", "meta.json.tmp")
         )
+        base_dir = self._config.kv_persist_dir or default_kv_cache_dir()
+        rank = getattr(getattr(self._config, "tp_info", None), "rank", 0)
+        marker = os.path.join(base_dir, f"{_SAVE_MARKER_PREFIX}{rank}")
+        try:
+            with open(marker, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
         try:
             buf = self._kv_pool._kv_buffer  # (2, L, P, ps, H, D)
             with open(tmp_kv, "wb") as f:
@@ -277,6 +288,11 @@ class CachePersister:
                 except OSError:
                     pass
             return False
+        finally:
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
         self._save_ok_path = d
         logger.info_rank0(
             "kv-persist: saved %d tokens / %d pages / %d GDN slots to %s",

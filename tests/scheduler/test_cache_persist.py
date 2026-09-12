@@ -157,9 +157,9 @@ def test_stale_snapshot_loads_cold(tmp_path):
 
 def test_default_kv_cache_dir_is_xdg_aware(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    assert default_kv_cache_dir() == str(tmp_path / "ft" / "KV_cache")
+    assert default_kv_cache_dir() == str(tmp_path / "freetoken" / "kv_cache")
     monkeypatch.delenv("XDG_CACHE_HOME")
-    assert default_kv_cache_dir().endswith(("ft" + "/" + "KV_cache"))
+    assert default_kv_cache_dir().endswith(("freetoken" + "/" + "kv_cache"))
 
 
 def test_page_size4_multi_node_chain(tmp_path):

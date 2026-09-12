@@ -9,7 +9,7 @@ LOG="$HOME/ft_server.log"
 
 # KV-persist: 1 = save/restore the prefix cache across restarts, 0 = off.
 KV_PERSIST="${FT_KV_PERSIST:-0}"
-# Snapshot directory ($XDG_CACHE_HOME/ft/KV_cache if unset).
+# Snapshot directory ($XDG_CACHE_HOME/freetoken/kv_cache if unset).
 KV_PERSIST_DIR="${FT_KV_PERSIST_DIR:-}"
 # Skip writing a snapshot larger than this many GiB (unset = unlimited).
 KV_PERSIST_MAX_GB="${FT_KV_PERSIST_MAX_GB:-}"

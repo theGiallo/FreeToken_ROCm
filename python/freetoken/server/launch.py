@@ -68,6 +68,20 @@ def _install_sigterm_keyboardinterrupt() -> None:
     signal.signal(signal.SIGTERM, _handle_term)
 
 
+def _ignore_signals_during_shutdown() -> None:
+    """Passivate SIGINT/SIGTERM once the graceful path begins.
+
+    The first signal already landed (it raised the KeyboardInterrupt we are handling). A
+    second one arriving while ``scheduler.shutdown()`` runs -- the user pressing ^C again, or
+    the supervisor's own ``p.terminate()`` from ``_terminate_backend_workers`` -- would raise
+    inside ``persister.save()`` and abort a KV snapshot mid-write. Ignoring both for the rest
+    of the process lets the save and the engine teardown finish; the worker then exits on its
+    own, which the supervisor attributes to the orderly stop."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
@@ -117,6 +131,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 meta = compute_cache_status_meta(scheduler.engine)
                 # the parent must not touch CUDA to learn this
                 meta["gpus"] = scheduler.gpus
+                # resolved snapshot root so the parent's reap backstop can watch the .saving
+                # markers without importing cache_persist (which pulls torch) into the api process
+                from freetoken.scheduler.cache_persist import default_kv_cache_dir
+
+                meta["kv_save_dir"] = args.kv_persist_dir or default_kv_cache_dir()
                 ack_queue.put(("meta", meta))
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
@@ -132,6 +151,9 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         try:
             scheduler.run_forever()
         except KeyboardInterrupt:
+            # First thing: stop a second signal from aborting the graceful path (see
+            # _ignore_signals_during_shutdown).
+            _ignore_signals_during_shutdown()
             logger = init_logger(__name__)
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C

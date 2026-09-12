@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import glob
 import json
 import os
 import signal
@@ -98,14 +99,35 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
     return timer
 
 
-def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
+_REAP_SAVE_GRACE_S = 1800.0  # hard ceiling on how long a snapshot write may extend the backstop
+
+
+def _reap_backend_workers(
+    processes: List[Any], timeout: float = 5.0, save_dir: str | None = None
+) -> None:
     """Wait out a preceding ``_terminate_backend_workers`` and SIGKILL whatever is still
     standing. Only the shell path needs this: it owns the process lifetime end to end (no
     outer signal takes the process down for it), and a worker that ignored SIGTERM would keep
-    the GPU and the IPC sockets after the shell has already returned to the user's terminal."""
+    the GPU and the IPC sockets after the shell has already returned to the user's terminal.
+
+    A worker that is mid-way through a KV-persist snapshot (unknown to us through SIGTERM,
+    which a graceful shutdown just passthroughs) is not "stuck": while a ``.saving.*`` marker
+    exists under ``save_dir`` the wait is extended, bounded by ``_REAP_SAVE_GRACE_S``, so the
+    backstop never evicts a write that the worker intends to finish anyway."""
+    marker_glob = os.path.join(save_dir, ".saving.*") if save_dir else None
+    save_started: float | None = None
+    deadline = time.monotonic() + timeout
     for p in processes or []:
         try:
-            p.join(timeout=timeout)
+            while time.monotonic() < deadline:
+                p.join(timeout=0.25)
+                if not p.is_alive():
+                    break
+                if marker_glob is not None and glob.glob(marker_glob):
+                    if save_started is None:
+                        save_started = time.monotonic()
+                    if time.monotonic() - save_started < _REAP_SAVE_GRACE_S:
+                        deadline = time.monotonic() + timeout
             if p.is_alive():
                 p.kill()
         except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
@@ -920,7 +942,10 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         # stop and tear the workers down here so nothing outlives the shell.
         _SHUTTING_DOWN.set()
         _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
-        _reap_backend_workers(_GLOBAL_STATE.backend_processes)
+        _reap_backend_workers(
+            _GLOBAL_STATE.backend_processes,
+            save_dir=getattr(_GLOBAL_STATE, "kv_save_dir", None),
+        )
 
 
 def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_shell: bool) -> None:
@@ -1020,6 +1045,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])
         _GLOBAL_STATE.unit_bytes = meta
+        # Resolved KV-persist snapshot root; the shell-mode reap backstop polls the .saving
+        # markers under it so a mid-write snapshot is never SIGKILLed (see _reap_backend_workers).
+        _GLOBAL_STATE.kv_save_dir = meta.pop("kv_save_dir", None)
 
     # Early-bind: supervise the backend on a daemon thread so uvicorn can bind
     # immediately and /health can report loading progress. Shell mode wants exactly the same
