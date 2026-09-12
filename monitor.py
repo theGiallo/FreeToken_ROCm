@@ -167,6 +167,19 @@ def _stats(vals):
     return mn, mean, trimmed, median, std, mx
 
 
+def _minmax(vals):
+    """(min, max) over non-zero values; (None, None) when there are none."""
+    s = sorted(v for v in vals if v != 0)
+    return (s[0], s[-1]) if s else (None, None)
+
+
+def _minmax_pair(lo, hi, fmt=".0f"):
+    """"[lo,hi]" over non-zero values, or a placeholder instead of a misleading [0,0]."""
+    if lo is None:
+        return "[--,--]"
+    return f"[{lo:{fmt}},{hi:{fmt}}]"
+
+
 def _median(vals) -> float:
     s = sorted(v for v in vals if v != 0)
     return s[len(s) // 2] if s else 0.0
@@ -317,7 +330,7 @@ def poll(args):
         all_dt = []
         all_pt = []
         all_it = []
-        last_plot_lines = []
+        last_table_lines = []
         # Per-request recap: key every finished request by (instance_id, uid) so a request
         # whose /v1/stats the poller sees more than once is counted exactly once. The
         # aggregate is a duration-weighted average (llama.cpp server_metrics style): sum of
@@ -428,7 +441,6 @@ def poll(args):
                     if show_plot:
                         lines += plot_lines
                         lines.append("")
-                    last_plot_lines = plot_lines
 
                     if show_last10:
                         lines.append(
@@ -446,9 +458,9 @@ def poll(args):
                             )
                         lines.append(f"  {'─'*76}")
 
-                    mn_dt, mean_dt, trim_dt, med_dt, std_dt, mx_dt = s_dt
-                    mn_pt, mean_pt, trim_pt, med_pt, std_pt, mx_pt = s_pt
-                    mn_it, mean_it, _, med_it, _, mx_it = s_it
+                    _, mean_dt, trim_dt, med_dt, std_dt, _ = s_dt
+                    _, mean_pt, trim_pt, med_pt, std_pt, _ = s_pt
+                    _, mean_it, _, med_it, _, _ = s_it
                     lines.append(
                         f"  {'AVG':<7}{mean_dt:7.1f}t  {mean_pt:7.0f}t  "
                         f"{mean_it:7.0f}t  {'':>6}  {'':>10}"
@@ -461,10 +473,12 @@ def poll(args):
                         f"  {'':7}±{std_dt:6.1f}   ±{std_pt:6.0f}   {'':>7}  {'':>6}  {'':>10}"
                     )
                     lines.append(
-                        f"  {'':7}[{mn_dt:.1f},{mx_dt:.1f}]"
-                        f"  [{mn_pt:.0f},{mx_pt:.0f}]"
-                        f"  [{mn_it:.0f},{mx_it:.0f}]"
+                        f"  {'':7}{_minmax_pair(*_minmax(all_dt), '.1f')}"
+                        f"  {_minmax_pair(*_minmax(all_pt), '.0f')}"
+                        f"  {_minmax_pair(*_minmax(all_it), '.0f')}"
                         f"  {'':>6}  {'':>10}"
+                        f"  {'':>5}  {_minmax_pair(*_minmax([r[7] for r in last10]), '.1f')}"
+                        f"  {_minmax_pair(*_minmax([r[8] for r in last10]), '.1f')}"
                     )
                     lines.append(
                         f"  {'MED':<7}{med_dt:7.1f}t  {med_pt:7.0f}t  "
@@ -512,17 +526,20 @@ def poll(args):
                             f"  in {in_s:.1f}s / out {out_s:.1f}s"
                         )
 
+                    last_table_lines = lines
                     print("\033[2J\033[H" + "\n".join(lines), flush=True)
                 else:
-                    lines = [
-                        f"Polling {API} every {POLL_INTERVAL}s → {path}",
-                        f"Samples: {seen}  (logged {n})    Ctrl+C to stop",
-                        "",
-                    ]
-                    if show_plot:
-                        lines += last_plot_lines
+                    if last_table_lines:
+                        lines = list(last_table_lines)
                         lines.append("")
-                    lines.append("  (server not responding)")
+                        lines.append("  (server not responding)")
+                    else:
+                        lines = [
+                            f"Polling {API} every {POLL_INTERVAL}s → {path}",
+                            f"Samples: {seen}  (logged {n})    Ctrl+C to stop",
+                            "",
+                            "  (server not responding)",
+                        ]
                     print("\033[2J\033[H" + "\n".join(lines), flush=True)
                 time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
