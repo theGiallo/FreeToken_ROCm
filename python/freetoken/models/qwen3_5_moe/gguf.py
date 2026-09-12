@@ -31,10 +31,12 @@ metadata. Differences from the HF path that this adapter absorbs:
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from freetoken.utils import init_logger
 from freetoken.layers.base import BaseOP
 from freetoken.models.config import (
     FullAttentionGroupConfig,
@@ -46,6 +48,8 @@ from freetoken.models.gguf.dequant import GGML_F32, GGML_Q4_0, GGML_Q8_0, dequan
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
+
+logger = init_logger(__name__)
 
 
 # --------------------------------------------------------------------------------------
@@ -855,7 +859,22 @@ def load_q4_0_expert_sources(
 
     def _load(sink) -> None:
         # gate + up + down: three packed-byte writes complete a layer.
+        # Report every 8 completed layers so the (minutes-long) serial build never
+        # looks hung and shows its per-layer cost and ETA.
         tracker = LayerCompletionTracker(3, hb, sink) if sink is not None else None
+        start = time.time()
+        next_log = 8
+        done = 0
+
+        def report(done: int) -> None:
+            elapsed = time.time() - start
+            per_layer = elapsed / done if done else 0.0
+            left = (L - done) * per_layer
+            logger.info_rank0(
+                f"expert banks: packed+pinned {done}/{L} layers in {elapsed:.1f}s "
+                f"({per_layer:.2f}s/layer, ~{left:.0f}s left)"
+            )
+
         for t in iter_gguf_tensors(model_path):
             if not t.name.startswith("blk."):
                 continue
@@ -874,6 +893,11 @@ def load_q4_0_expert_sources(
                 continue
             if tracker is not None:
                 tracker.note(layer)
+            done = len(seen_gu & seen_dn)
+            if done >= next_log:
+                report(done)
+                next_log = min(L, next_log + 8)
+        report(done)
 
     if layer_sink is not None:
         _load(layer_sink)
