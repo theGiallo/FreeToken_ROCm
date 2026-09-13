@@ -308,3 +308,24 @@ row-band-within-tensor and the note sequence is byte-identical to serial.
 (Back to the rank-ordered list for the decode gap proper -- §1-8 unchanged; this §9
 is closed as a *plan* pending 9.4's measurement, per the harness rule that
 hypotheses ship as plans, not as code without a passing test.)
+
+### 9.4 Measurement anchor (byte-verified 2026-09-13)
+
+9.2's serial/target numbers and any byte-identity measurement MUST be taken with
+this box's actual entrypoints, which live in WSL (FreeToken runs *inside* WSL,
+not on the Windows side):
+
+- `nexus/f/programming/llm/launch_qwen35.sh` (161 lines) -> emits
+  `wsl -e bash -lc "exec $FT serve --model ... --moe-backend offload
+  --kv-reserve-tokens $KVRES --moe-cache-rate $RATE --num-tokens $CTX ..."`
+  with budget 21.15 GiB, reserve 1.5 GiB, KV 20 KiB/tok, TOTAL_EXPERTS=10240,
+  PER_SLOT_BYTES=1376256 -- the exact build+placement workload this plan grates
+  against. Measurement command:
+  `wsl -e bash -lc "exec $FT serve --model ... --moe-backend offload ..."`.
+
+- `launch_qwen_3.6_35b-a3b_max-ctx_kv-persist.sh` (2 lines) -> thin wrapper:
+  `./launch_qwen35.sh --ctx 262144 --mode thinking --kv-persist 1
+  --kv-persist-max-gb 10` -- the max-ctx KV-persist variant 9.2 also targets.
+
+Do NOT measure with a hand-typed `ft serve` invocation that contradicts these;
+the launch scripts are the single source of truth for the on-box flags.
