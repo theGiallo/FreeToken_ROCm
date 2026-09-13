@@ -8,6 +8,7 @@ from .gguf import (
     iter_qwen35_gguf_weights,
     iter_qwen35moe_gguf_weights,
     load_q4_0_expert_sources,
+    load_q4_0_expert_sources_parallel,
     parse_qwen35_gguf_config,
     parse_qwen35moe_gguf_config,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "convert_qwen35moe_to_gguf",
     "is_qwen35moe_gguf_model",
     "load_q4_0_expert_sources",
+    "load_q4_0_expert_sources_parallel",
     "dummy_q4_0_expert_sources",
     "iter_weights",
     "iter_weights_parallel",
