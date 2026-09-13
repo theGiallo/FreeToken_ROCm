@@ -570,9 +570,9 @@ class Engine:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
             # expert-tensor granularity. Both pin-after-fill.
-            # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
-            # pick (parallel for scattered experts, with a low-RAM fallback to serial).
-            expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+            # --expert-load: serial/odirect force the read; auto (None) lets load_expert_banks
+            # pick (O_DIRECT for scattered experts, with a low-RAM fallback to serial).
+            expert_parallel = {"serial": False, "odirect": True, "parallel": True}.get(config.expert_load, None)
             requested_residency = None
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency

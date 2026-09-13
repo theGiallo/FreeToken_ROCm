@@ -39,6 +39,92 @@ _ST_DTYPE = {
 _ODIRECT_BLK = 4096
 
 
+class _FrontierOdirectReader:
+    """Stream a whole shard via multi-threaded O_DIRECT with an ordered "frontier".
+
+    Chunk preads fill a page-aligned mmap from the front (threads draw chunk indexes in
+    order), and ``wait(need)`` blocks until byte ``need`` (inclusive end of a region) has
+    been covered, i.e. every leading chunk up to it is complete. The GGUF expert reader
+    consumes tensor bytes as soon as their ``data_offset + n_bytes`` is ready, so the
+    caller's placement overlaps the rest of the read instead of waiting for the whole
+    file (measured alone the O_DIRECT read is ~5x faster than the placement, so before
+    overlap it was the serial tail that decided the build time). Failures in a worker
+    surface on the next ``wait``. ``close()`` closes the fd, aborting outstanding reads.
+    """
+
+    def __init__(self, path: str, workers: int, chunk: int) -> None:
+        self.size = os.path.getsize(path)
+        self.asize = ((self.size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK
+        self._fd = os.open(path, os.O_RDONLY | os.O_DIRECT)  # fails fast (no buffer yet) on unsupported FS
+        self.buf = mmap.mmap(-1, self.asize)
+        self.mv = memoryview(self.buf)
+        self._chunk = chunk
+        self._offs = list(range(0, self.size, chunk))
+        self._ends = [min(o + chunk, self.size) for o in self._offs]
+        self._done = [False] * len(self._offs)
+        self._next = 0
+        self._idx = 0
+        self._ready = 0
+        self._failed: BaseException | None = None
+        self._closing = False
+        self._cv = threading.Condition()
+        self._threads: list[threading.Thread] = []
+        for _ in range(max(1, min(workers, len(self._offs)))):
+            t = threading.Thread(target=self._worker, name="ft-odirect", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _worker(self) -> None:
+        while True:
+            with self._cv:
+                if self._closing or self._failed is not None:
+                    return
+                if self._next >= len(self._offs):
+                    return
+                i = self._next
+                self._next += 1
+            try:
+                self._read(i)
+            except BaseException as exc:
+                with self._cv:
+                    if not self._closing:
+                        self._failed = exc
+                    self._cv.notify_all()
+                return
+            with self._cv:
+                self._done[i] = True
+                while self._idx < len(self._offs) and self._done[self._idx]:
+                    self._idx += 1
+                self._ready = self._ends[self._idx - 1] if self._idx else 0
+                self._cv.notify_all()
+
+    def _read(self, i: int) -> None:
+        o = self._offs[i]
+        want = ((self._ends[i] - o + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK
+        os.preadv(self._fd, [self.mv[o:o + want]], o)
+
+    def wait(self, need: int) -> None:
+        """Block until the first ``need`` bytes of the shard are fully read (or fail)."""
+        with self._cv:
+            while self._ready < need and self._failed is None:
+                self._cv.wait(0.2)
+            if self._failed is not None and self._ready < need:
+                raise self._failed
+
+    def close(self) -> None:
+        """Abort outstanding reads and release the buffer; idempotent."""
+        with self._cv:
+            if self._closing:
+                return
+            self._closing = True
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            del self._fd
+            self._cv.notify_all()
+
+
 def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mmap:
     """Read a whole shard into a page-aligned mmap via CHUNKED multi-threaded O_DIRECT.
     Multi-threading one fd scales even for single-shard checkpoints (measured ~7x at 8
@@ -161,6 +247,77 @@ def iter_expert_tensors_parallel(
         th.join()
     if err:
         raise err[0]
+
+
+def iter_gguf_expert_tensors_parallel(
+    model_path: str,
+    is_expert: Callable[[str], bool],
+    *,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+    drop_cache: bool = True,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Parallel O_DIRECT analog of ``reader.iter_gguf_tensors`` for a single packed GGUF.
+
+    GGUF keeps every tensor in ONE file (no safetensors shards), so the multi-shard reader
+    doesn't apply: parse the tensor table for the expert tensors' byte ranges, then stream
+    the file with chunked multi-threaded O_DIRECT (bypasses the page cache -- the mmap'd
+    dense and expert data never faults into RAM) and yield ``(name, packed uint8 [rows,
+    row_bytes])`` views into the transient buffer, freed when the iterator is exhausted.
+
+    The read and the consumption OVERLAP (unlike the pre-existing whole-file-then-stream
+    shape): tensors are yielded as soon as their byte range is read (frontier-gated), so
+    the caller's placement starts on layer 0 while the disk still streams the rest of the
+    expert data. O_DIRECT on a filesystem that doesn't support it raises NotImplementedError
+    up front (nothing allocated yet -- the fd probe precedes the buffer), so the caller's
+    serial fallback fires before any bank leak.
+    """
+    import numpy as np
+
+    import gguf
+    from freetoken.models.gguf.dequant import row_bytes
+    from freetoken.models.gguf.reader import _reader
+    from freetoken.utils.progress import byte_bar
+
+    reader = _reader(model_path)
+    expert = [t for t in reader.tensors if is_expert(t.name)]
+    if not expert:  # no experts worth reading (the model owns setup elsewhere)
+        return
+    if drop_cache:
+        try:
+            fd0 = os.open(model_path, os.O_RDONLY)
+            os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd0)
+        except OSError:
+            pass
+    bar = byte_bar(sum(t.n_bytes for t in expert), "Loading experts (parallel)")
+    src = None
+    try:
+        try:
+            src = _FrontierOdirectReader(model_path, workers, chunk)
+        except OSError as exc:
+            raise NotImplementedError(
+                f"GGUF parallel reader: O_DIRECT read failed ({exc})") from exc
+        mv = src.mv
+        for t in expert:
+            ne = [int(s) for s in t.shape]  # ggml order, fastest dim first (matches the reader)
+            rb = row_bytes(ne[0], t.tensor_type)
+            rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
+            if rows * rb != t.n_bytes:
+                raise ValueError(f"{t.name}: {rows}x{rb} packed bytes != {t.n_bytes} in the table")
+            try:
+                src.wait(t.data_offset + t.n_bytes)
+            except OSError as exc:
+                raise NotImplementedError(
+                    f"GGUF parallel reader: O_DIRECT read failed ({exc})") from exc
+            raw = np.frombuffer(mv[t.data_offset:t.data_offset + t.n_bytes], dtype=np.uint8)
+            yield t.name, torch.from_numpy(raw.reshape(rows, rb))
+            bar.update(t.n_bytes)
+    finally:
+        bar.close()
+        if src is not None:
+            src.close()
+        del src
 
 
 _SCATTERED_AVG_BYTES = 16 << 20  # avg expert tensor below this -> "scattered" -> prefer parallel
@@ -342,6 +499,25 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_q4_0_moe_expert_sources_parallel(
+    model_path: str,
+    model_config,
+    *,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+    layer_sink=None,
+) -> dict:
+    """Load packed GGUF Q4_0 expert banks with the GGUF-native parallel reader (tensor
+    table + chunked multi-threaded O_DIRECT over the one file). A model without the hook
+    raises NotImplementedError up front, so the caller falls back to serial unimpeded."""
+    _config, spec = _spec_for_model_path(model_path)
+    loader = _model_override(spec, "load_q4_0_expert_sources_parallel")
+    if loader is None:
+        raise NotImplementedError(
+            f"{spec.module} provides no load_q4_0_expert_sources_parallel")
+    return loader(model_path, model_config, workers=workers, chunk=chunk, layer_sink=layer_sink)
+
+
 def _num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:
@@ -410,4 +586,6 @@ __all__ = [
     "dummy_moe_expert_sources",
     "dummy_nvfp4_expert_sources",
     "iter_expert_tensors_parallel",
+    "iter_gguf_expert_tensors_parallel",
+    "load_q4_0_moe_expert_sources_parallel",
 ]

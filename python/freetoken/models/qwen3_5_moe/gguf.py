@@ -832,20 +832,10 @@ def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], 
     }
 
 
-def load_q4_0_expert_sources(
-    model_path: str, config: ModelConfig, *, layer_sink=None
-) -> dict[str, list[torch.Tensor]]:
-    """Per-layer host banks of the routed experts' native ggml block bytes.
-
-    Same contract as gemma4's Q4_0 loader, generalized over the checkpoint's actual
-    per-bank ggml types (:data:`ModelConfig.expert_gguf_types`; Qwen3.x GGUF mixes Q4_K
-    gate/up with Q6_K down): ``gate_up`` merges the separate ``ffn_gate_exps`` +
-    ``ffn_up_exps`` packed rows into one ``[E, 2I, rb(H)]`` bank per layer, ``down`` is
-    ``[E, H, rb(I)]`` verbatim. Whole layers arrive in one shot so the offload cache
-    streams whole experts to the ggml MoE kernels."""
+def _q4_load_buffers(config: ModelConfig):
+    """Shared prelude for the q4_0 loaders: tp1 guard, geometry, empty per-layer banks."""
     from freetoken.models.gguf.dequant import row_bytes
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import alloc_layer_banks
 
     _require_tp1("expert banks")
     L, E = config.num_layers, config.num_experts
@@ -855,13 +845,22 @@ def load_q4_0_expert_sources(
     i_bytes = row_bytes(I, dn_type)
     hb = alloc_layer_banks(_q4_0_expert_specs(config), L)
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
-    seen_gu, seen_dn = set(), set()
+    return banks, hb, L, E, H, I, h_bytes, i_bytes
 
-    def _load(sink) -> None:
-        # gate + up + down: three packed-byte writes complete a layer.
-        # Report every 8 completed layers so the (minutes-long) serial build never
-        # looks hung and shows its per-layer cost and ETA.
-        tracker = LayerCompletionTracker(3, hb, sink) if sink is not None else None
+
+def _q4_fill_banks(banks, hb, L, E, H, I, h_bytes, i_bytes, stream, sink):
+    """Fill the ``gate_up`` + ``down`` per-layer banks from a ``(name, packed)`` stream.
+
+    Three packed-byte writes complete a layer (gate + up + down); ``sink`` (a
+    ``PinPipeline`` or converter layer sink) fires once per completed layer. Reports
+    progress every 8 completed layers so the (minutes-long) builds never look hung and
+    show their per-layer cost and ETA. Returns ``(seen_gu, seen_dn)``.
+    """
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
+
+    def run(inner_sink):
+        tracker = LayerCompletionTracker(3, hb, inner_sink) if inner_sink is not None else None
+        seen_gu, seen_dn = set(), set()
         start = time.time()
         next_log = 8
         done = 0
@@ -876,19 +875,19 @@ def load_q4_0_expert_sources(
                 f"({per_layer:.2f}s/layer, ~{left:.0f}s left)"
             )
 
-        for t in iter_gguf_tensors(model_path):
-            if not t.name.startswith("blk."):
+        for name, packed in stream:
+            if not name.startswith("blk."):
                 continue
-            layer = int(t.name.split(".")[1])
-            suffix = t.name.split(".", 2)[2]
+            layer = int(name.split(".")[1])
+            suffix = name.split(".", 2)[2]
             if suffix == "ffn_gate_exps.weight":
-                banks["gate_up"][layer][:, :I].copy_(t.packed().reshape(E, I, h_bytes))
+                banks["gate_up"][layer][:, :I].copy_(packed.reshape(E, I, h_bytes))
                 seen_gu.add(layer)
             elif suffix == "ffn_up_exps.weight":
-                banks["gate_up"][layer][:, I:].copy_(t.packed().reshape(E, I, h_bytes))
+                banks["gate_up"][layer][:, I:].copy_(packed.reshape(E, I, h_bytes))
                 seen_gu.add(layer)
             elif suffix == "ffn_down_exps.weight":
-                banks["down"][layer].copy_(t.packed().reshape(E, H, i_bytes))
+                banks["down"][layer].copy_(packed.reshape(E, H, i_bytes))
                 seen_dn.add(layer)
             else:
                 continue
@@ -901,20 +900,63 @@ def load_q4_0_expert_sources(
                 next_log = min(L, next_log + 8)
         if done != reported:
             report(done)
+        return seen_gu, seen_dn
 
-    if layer_sink is not None:
-        _load(layer_sink)
-    elif torch.cuda.is_available():
+    if sink is not None:
+        return run(sink)
+    if torch.cuda.is_available():
         with PinPipeline() as pins:
-            _load(pins)
-    else:
-        _load(None)
+            return run(pins)
+    return run(None)
 
+
+def _q4_load_stream(config: ModelConfig, stream, layer_sink) -> dict[str, list[torch.Tensor]]:
+    """Shared driver: fill from ``stream`` of ``(name, packed)`` pairs and verify complete."""
+    banks, hb, L, E, H, I, h_bytes, i_bytes = _q4_load_buffers(config)
+    seen_gu, seen_dn = _q4_fill_banks(banks, hb, L, E, H, I, h_bytes, i_bytes, stream, layer_sink)
     want = set(range(L))
     assert seen_gu == want and seen_dn == want, (
         f"missing expert layers: gate_up {sorted(want - seen_gu)}, down {sorted(want - seen_dn)}"
     )
     return banks
+
+
+def load_q4_0_expert_sources(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """Per-layer host banks of the routed experts' native ggml block bytes.
+
+    Same contract as gemma4's Q4_0 loader, generalized over the checkpoint's actual
+    per-bank ggml types (:data:`ModelConfig.expert_gguf_types`; Qwen3.x GGUF mixes Q4_K
+    gate/up with Q6_K down): ``gate_up`` merges the separate ``ffn_gate_exps`` +
+    ``ffn_up_exps`` packed rows into one ``[E, 2I, rb(H)]`` bank per layer, ``down`` is
+    ``[E, H, rb(I)]`` verbatim. Whole layers arrive in one shot so the offload cache
+    streams whole experts to the ggml MoE kernels."""
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    stream = ((t.name, t.packed()) for t in iter_gguf_tensors(model_path))
+    return _q4_load_stream(config, stream, layer_sink)
+
+
+def load_q4_0_expert_sources_parallel(
+    model_path: str, config: ModelConfig, *, workers: int = 8, chunk: int = 8 << 20,
+    layer_sink=None,
+) -> dict[str, list[torch.Tensor]]:
+    """Parallel (chunked multi-threaded O_DIRECT, no page cache) version of
+    :func:`load_q4_0_expert_sources`: the GGUF tensor table is parsed for the expert byte
+    ranges and the one file is read with ``iter_gguf_expert_tensors_parallel``. Same banks,
+    same pin-after-fill pipeline."""
+    from freetoken.models.weight import iter_gguf_expert_tensors_parallel
+
+    def is_expert(name: str) -> bool:
+        return name.startswith("blk.") and name.split(".", 2)[2] in (
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        )
+
+    stream = iter_gguf_expert_tensors_parallel(model_path, is_expert, workers=workers, chunk=chunk)
+    return _q4_load_stream(config, stream, layer_sink)
 
 
 def dummy_q4_0_expert_sources(config: ModelConfig) -> dict[str, list[torch.Tensor]]:
@@ -940,6 +982,7 @@ __all__ = [
     "convert_qwen35moe_to_gguf",
     "is_qwen35moe_gguf_model",
     "load_q4_0_expert_sources",
+    "load_q4_0_expert_sources_parallel",
     "dummy_q4_0_expert_sources",
     "GGUFMergedLinear",
     "GGUFLMHead",

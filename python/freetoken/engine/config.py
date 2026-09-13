@@ -25,10 +25,10 @@ class EngineConfig:
     nvfp4_backend: str = "triton"
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
-    # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
-    # experts in parallel but falls back to serial when free RAM can't cover the banks + the
-    # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
-    # low-memory reclaimable read; "parallel" forces the fast read.
+    # Expert-bank host load (--expert-load): auto|serial|odirect. "auto" uses the parallel
+    # O_DIRECT reader but falls back to serial when free RAM can't cover the banks + the
+    # reader's extra (non-reclaimable) whole-file buffer; "serial" forces the low-memory
+    # reclaimable read; "odirect" forces the O_DIRECT reader (no RAM guard).
     expert_load: str = "auto"
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None

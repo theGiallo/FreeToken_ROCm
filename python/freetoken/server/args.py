@@ -543,12 +543,14 @@ def parse_args(
     parser.add_argument(
         "--expert-load",
         default=ServerArgs.expert_load,
-        choices=["auto", "serial", "parallel"],
+        choices=["auto", "serial", "odirect", "parallel"],
         help=(
-            "How MoE expert banks are read into host RAM. 'auto' (default) reads scattered "
-            "experts in parallel (fast) but falls back to serial when free RAM can't cover "
-            "the banks + the parallel reader's extra whole-shard buffer; 'serial' forces the "
-            "low-memory reclaimable read (slower); 'parallel' forces the fast read."
+            "How MoE expert banks are read into host RAM. 'auto' (default) uses the parallel "
+            "O_DIRECT reader (bypasses the page cache; fast) but falls back to the serial mmap "
+            "read when free RAM can't cover the banks + the reader's extra whole-file buffer; "
+            "'serial' forces the low-memory reclaimable mmap read; 'odirect' forces the "
+            "O_DIRECT parallel reader (no RAM guard). 'parallel' is a deprecated alias for "
+            "'odirect'."
         ),
     )
 

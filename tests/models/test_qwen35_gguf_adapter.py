@@ -8,6 +8,9 @@ superblocks), so its byte layout must match ggml's quantize_row_q8_0 exactly.
 """
 from __future__ import annotations
 
+import os
+
+import pytest
 import torch
 
 
@@ -240,6 +243,7 @@ def test_registry_and_tokenizer_wiring_for_moe():
     assert callable(getattr(module, spec.iter_weights))
     # The offload provider resolves these hooks through the same module namespace.
     assert callable(getattr(module, "load_q4_0_expert_sources"))
+    assert callable(getattr(module, "load_q4_0_expert_sources_parallel"))
     assert callable(getattr(module, "dummy_q4_0_expert_sources"))
 
     assert GGUF_ARCH_TO_REGISTRY["qwen35moe"] == "Qwen35MoeGGUFForCausalLM"
@@ -280,3 +284,179 @@ def test_moe_layer_receives_gguf_types_via_extra_attrs(monkeypatch):
     kw = captured["kw"]
     assert kw["layer_id"] == 0 and kw["renormalize"] is True
     assert kw["extra_attrs"] == {"gguf_gate_up_type": 12, "gguf_down_type": 14}
+
+
+def test_q4_fill_banks_merges_gate_up_down_and_tracks_layers():
+    """The shared q4_0 fill merges the three expert writes per layer into the gate_up +
+    down banks and fires the sink once per completed layer, skipping every decoy tensor."""
+    from types import SimpleNamespace
+
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    from freetoken.models.qwen3_5_moe.gguf import _q4_fill_banks, _q4_load_buffers
+
+    cfg = SimpleNamespace(
+        num_layers=2,
+        num_experts=3,
+        hidden_size=256,
+        moe_intermediate_size=256,
+        expert_gguf_types=(12, 14),
+    )
+    banks, hb, L, E, H, I, h_bytes, i_bytes = _q4_load_buffers(cfg)
+    assert L == 2 and h_bytes == 144 and i_bytes == 210
+
+    done_layers = []
+
+    class Sink:
+        def __call__(self, layer_id, layer_banks):
+            done_layers.append(layer_id)
+
+    stream = [
+        ("blk.0.attn_q.weight", torch.zeros(1, 4)),  # non-expert blk tensor: skipped
+        ("blk.0.ffn_gate_exps.weight",
+         torch.full((E * I, h_bytes), 1, dtype=torch.uint8)),
+        ("blk.0.ffn_up_exps.weight",
+         torch.full((E * I, h_bytes), 2, dtype=torch.uint8)),
+        ("blk.0.ffn_down_exps.weight",
+         torch.full((E * H, i_bytes), 3, dtype=torch.uint8)),
+        ("mtp.layers.0.ffn_gate_exps.weight",
+         torch.full((E * I, h_bytes), 9, dtype=torch.uint8)),  # non-blk: skipped
+        ("blk.1.ffn_gate_exps.weight",
+         torch.full((E * I, h_bytes), 4, dtype=torch.uint8)),
+        ("blk.1.ffn_up_exps.weight",
+         torch.full((E * I, h_bytes), 5, dtype=torch.uint8)),
+        ("blk.1.ffn_down_exps.weight",
+         torch.full((E * H, i_bytes), 6, dtype=torch.uint8)),
+    ]
+    seen_gu, seen_dn = _q4_fill_banks(banks, hb, L, E, H, I, h_bytes, i_bytes, stream, Sink())
+    assert seen_gu == {0, 1} and seen_dn == {0, 1}
+    assert done_layers == [0, 1]
+    gu0, dn0 = banks["gate_up"][0], banks["down"][0]
+    assert gu0.shape == (E, 2 * I, h_bytes) and gu0.dtype == torch.uint8
+    assert torch.equal(gu0[:, :I], torch.full((E, I, h_bytes), 1, dtype=torch.uint8))
+    assert torch.equal(gu0[:, I:], torch.full((E, I, h_bytes), 2, dtype=torch.uint8))
+    assert torch.equal(dn0, torch.full((E, H, i_bytes), 3, dtype=torch.uint8))
+    assert banks["gate_up"][1][0, 0, 0].item() == 4
+    assert banks["gate_up"][1][0, I, 0].item() == 5
+    assert banks["down"][1][0, 0, 0].item() == 6
+
+
+def _write_mini_gguf(path):
+    """1 expert Q4_K + 1 expert Q6_K + 1 non-expert F32 tensor (deterministic bytes)."""
+    import gguf
+    import numpy as np
+
+    T = gguf.GGMLQuantizationType
+    w = gguf.GGUFWriter(str(path), "qwen35moe")
+    w.add_name("mini")
+    w.add_block_count(1)
+    w.add_quantization_version(2)
+
+    def add_packed(name, blocks, qtype, ts):
+        data = (np.arange(blocks * ts, dtype=np.uint64) % 251).astype(np.uint8).reshape(blocks, ts)
+        w.add_tensor(name, data, raw_dtype=qtype)
+
+    add_packed("blk.0.ffn_gate_exps.weight", 256, T.Q4_K, 144)
+    add_packed("blk.0.ffn_down_exps.weight", 256, T.Q6_K, 210)
+    w.add_tensor("blk.0.attn_gate.weight", np.arange(8, dtype=np.float32), raw_dtype=T.F32)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def _pseudo_frontier_reader():
+    """A synchronous stand-in for ``_FrontierOdirectReader`` (no O_DIRECT available in CI):
+    whole-file read up front, ``wait`` a no-op, ``close`` dropping the buffer refs (like the
+    real reader, which also just closes the fd and lets GC free the mmap once the numpy
+    views that export it are gone)."""
+    import mmap as _mmap
+
+    class PseudoReader:
+        def __init__(self, model_path, workers, chunk):
+            size = os.path.getsize(model_path)
+            buf = _mmap.mmap(-1, ((size + 4095) // 4096) * 4096)
+            with open(model_path, "rb") as f:
+                f.readinto(memoryview(buf)[:size])
+            self.buf = buf
+            self.mv = memoryview(buf)
+
+        def wait(self, need):
+            return None
+
+        def close(self):
+            return None
+
+    return PseudoReader
+
+
+def test_iter_gguf_expert_tensors_parallel_slices_packed_bytes(tmp_path, monkeypatch):
+    """The GGUF-native parallel reader yields exactly the packed [rows, row_bytes] bytes for
+    the expert tensors and nothing else, sliced at the real table offsets."""
+    import numpy as np
+
+    from freetoken.models import weight as weight_mod
+    from freetoken.models.weight import iter_gguf_expert_tensors_parallel
+
+    path = tmp_path / "mini.gguf"
+    _write_mini_gguf(path)
+    monkeypatch.setattr(weight_mod, "_FrontierOdirectReader", _pseudo_frontier_reader())
+    got = dict(iter_gguf_expert_tensors_parallel(str(path), lambda n: n.endswith("exps.weight")))
+    assert list(got) == ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"]
+    for t in got.values():
+        assert t.dtype == torch.uint8 and t.ndim == 2
+    assert got["blk.0.ffn_gate_exps.weight"].shape == (256, 144)
+    want = (np.arange(256 * 144, dtype=np.uint64) % 251).astype(np.uint8).reshape(256, 144)
+    assert torch.equal(got["blk.0.ffn_gate_exps.weight"], torch.from_numpy(want))
+    assert got["blk.0.ffn_down_exps.weight"].shape == (256, 210)
+    want_dn = (np.arange(256 * 210, dtype=np.uint64) % 251).astype(np.uint8).reshape(256, 210)
+    assert torch.equal(got["blk.0.ffn_down_exps.weight"], torch.from_numpy(want_dn))
+
+
+def test_gguf_parallel_reader_reports_odirect_failure_as_notimplemented(tmp_path, monkeypatch):
+    """Fail-fast on an O_DIRECT-unsupported filesystem: NotImplementedError (before any
+    bank allocation) so the caller's serial build falls back cleanly."""
+    import gguf
+
+    from freetoken.models import weight as weight_mod
+    from freetoken.models.weight import iter_gguf_expert_tensors_parallel
+
+    path = tmp_path / "fail.gguf"
+    _write_mini_gguf(path)
+
+    def boom(model_path, workers, chunk):
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(weight_mod, "_FrontierOdirectReader", boom)
+    with pytest.raises(NotImplementedError):
+        list(iter_gguf_expert_tensors_parallel(str(path), lambda n: n.endswith("exps.weight")))
+
+
+def test_gguf_parallel_reader_consumes_greedily_in_file_order(tmp_path, monkeypatch):
+    """Streaming contract: ``wait`` is called once per expert tensor with a monotonic
+    end-offset (each tensor handed to the consumer as soon as its bytes are covered, not
+    after a whole-file read), and the reader is closed on completion."""
+    from freetoken.models import weight as weight_mod
+    from freetoken.models.weight import iter_gguf_expert_tensors_parallel
+
+    path = tmp_path / "mini.gguf"
+    _write_mini_gguf(path)
+    waits, closes = [], []
+
+    class RecReader(_pseudo_frontier_reader()):
+        def wait(self, need):
+            waits.append(need)
+            return super().wait(need)
+
+        def close(self):
+            closes.append(1)
+            return super().close()
+
+    monkeypatch.setattr(weight_mod, "_FrontierOdirectReader", RecReader)
+    got = [name for name, _ in iter_gguf_expert_tensors_parallel(
+        str(path), lambda n: n.endswith("exps.weight"))]
+    assert got == ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight"]
+    assert waits == sorted(waits) and len(waits) == 2
+    assert closes == [1]

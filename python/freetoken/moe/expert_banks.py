@@ -233,20 +233,24 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
 
 
 def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
-    if parallel:
-        raise NotImplementedError(
-            "parallel reader not implemented for q4_0: GGUF is a single packed file "
-            "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
-            "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
-        )
-    from freetoken.models.weight import load_q4_0_moe_expert_sources
+    from freetoken.models.weight import (
+        load_q4_0_moe_expert_sources,
+        load_q4_0_moe_expert_sources_parallel,
+    )
 
     # Native GGUF Q4_0 routed experts: packed block bytes streamed to the GPU and
     # dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy). Banks are
     # per-layer HostBanks (pin-after-fill), so conversion streams each completed layer's
     # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
     sink = None if dummy else layer_sink
-    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    if parallel and not dummy:
+        # GGUF is a single packed file (not safetensors): the GGUF-native parallel reader
+        # (tensor table + chunked O_DIRECT over the one file) lives on the model hook.
+        sources = load_q4_0_moe_expert_sources_parallel(
+            model_path, model_config, workers=workers, chunk=chunk, layer_sink=sink
+        )
+    else:
+        sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
     return ExpertBanks(
         "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
     )
@@ -465,15 +469,15 @@ def load_expert_banks(
         # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
         # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
-        # free RAM can't cover the banks + one shard's transient. (--expert-load serial/parallel
+        # free RAM can't cover the banks + one shard's transient. (--expert-load serial/odirect
         # bypass this by forcing ``parallel`` explicitly.)
         if parallel and not _host_ram_fits_parallel(model_path):
             logger.warning_rank0(
                 "expert banks: low free RAM -> serial build (avoids parallel-reader OOM; "
-                "override with --expert-load parallel)"
+                "override with --expert-load odirect)"
             )
             parallel = False
-    logger.info_rank0(f"expert banks: slow path ({'parallel' if parallel else 'serial'} build)")
+    logger.info_rank0(f"expert banks: slow path ({'O_DIRECT' if parallel else 'serial'} build)")
     # parallel's reader resolves hub ids + handles single-file/no-index checkpoints, so it won't
     # OSError on those (which would leak the banks it pre-allocated, since host banks live for
     # the process). Only NotImplementedError (quant has no parallel reader; raised before any
@@ -487,7 +491,7 @@ def load_expert_banks(
         except NotImplementedError as exc:
             if not parallel:
                 raise
-            logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
+            logger.warning_rank0(f"O_DIRECT reader unavailable ({exc}); falling back to serial build")
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
                                         decode_target, layer_sink)
     return _echo_residency(banks, layer_residency, residency_plan)
