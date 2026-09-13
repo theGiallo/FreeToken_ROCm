@@ -219,3 +219,92 @@ three-way reference re-measurement (llama.cpp 107.9 / ollama 103.5 / FreeToken
 headroom: ~6.5 ms/token host-side between graph replays (wall vs device-busy),
 router top-K torch fallback (~0.9 ms), residual unattributed thin rocBLAS calls
 (~0.9 ms).
+
+## 9. Next lever: parallelize expert-bank PLACEMENT (the packed->bank copies), not the read (2026-09-13)
+
+Read is already overlapped by the O_DIRECT frontier (UPDATE 2: whole-file
+17.4 -> 11.2 s build, read ~4.6-5.5 s tucked under placement). This section is
+the *plan* for the remaining tail, so it inherits the harness rules: every
+claim must be backed by a measurement this harness performs (or be explicitly
+marked a hypothesis), and no code lands before a byte-identical + ordering-
+preserving test passes.
+
+### 9.1 What the serial fill does (real contract, from `git show HEAD`, not memory)
+
+`_q4_fill_banks` (python/freetoken/models/qwen3_5_moe/gguf.py:851) iterates the
+`(name, packed)` stream *in stream order*; three packed-byte writes complete a
+layer:
+- `ffn_gate_exps.weight` -> `banks["gate_up"][layer][:, :I]` (left band)
+- `ffn_up_exps.weight`   -> `banks["gate_up"][layer][:, I:]` (right band)
+- `ffn_down_exps.weight` -> `banks["down"][layer]`
+
+i.e. `gate_up` merges gate at `[:, :I]` with up at `[:, I:]` (a 2I row bank of
+`rb(H)` rows), `down` is `[E, H, rb(I)]`. Every write is `rows * rb` contiguous
+bytes on both sides (a packed row reshaped into the bank's `[hi-lo, rb]` band).
+`tracker.note(layer)` fires once per tensor **after** its copy; the
+`LayerCompletionTracker(3, hb, sink)` fires the pin pipeline / converter sink
+once per completed layer, and the MoE host kernels consume per-layer banks. The
+builds are minutes-long, so progress is logged every 8 completed layers.
+
+### 9.2 The parallel placement that is provably safe
+
+Each individual `.copy_` is `rows * rb` contiguous on BOTH sides (packed row
+buffer and the disjoint bank band). Splitting ONE tensor's copy into
+`placement_workers` disjoint **row bands** (plain memcpy per band, non-overlapping
+byte ranges on both sides) is byte-identical to the serial copy and farms out
+linearly -- exactly the trick the O_DIRECT frontier reader already uses for reads,
+so it is battle-proven in this codebase. Ordering is untouched: the consumer loop
+still calls `tracker.note(layer)` once per tensor in stream order after ALL its
+rows have landed, so layers keep completing gate-then-up-then-down in the exact
+sequence the serial path produced; the pin pipeline and the MoE kernels see the
+same per-layer byte sequence (their contract only requires every row byte below
+`h_bytes`/`i_bytes` to be written once, which disjoint bands preserve).
+
+Deliberately NOT done: parallelizing the *consumer loop itself* (dispatching
+whole tensors to a pool and noting out of stream order). That changes when
+`tracker.note` fires relative to the serial path and would risk reordering the
+pin/sink sequence; it is off the table until 9.5's ordering test proves the
+tracker tolerates it (the tracker docstring claims it does -- "write layers from
+many threads in arbitrary order" -- but "claims" is not "measured").
+
+### 9.3 Hypothesis (ranked): placement is now the dominant uncovered term
+
+- **P1 (high)**: after UPDATE 2, the read is hidden and placement is the
+  single-threaded `copy_` tail. Expected farm-out: row-band memcpy across
+  `placement_workers` threads moves placement cost down toward the frontier
+  reader's measured O_DIRECT band memcpy throughput on this box.
+- **P2 (low)**: gains wash out because the copies are already near memcpy
+  roofline and pinned-bank writes are bandwidth-bound. That would say the real
+  lever is GPU-side (attention split-K / graph replay spacing), not placement.
+
+### 9.4 Experiment to close it (cheap, this harness)
+
+1. Write `tests/models/test_qwen35_placement_parallel.py` (or extend
+   `tests/models/test_qwen35_gguf_adapter.py`): a synthetic `(name, packed)`
+   stream over `L` layers builds the banks twice -- once via the SAAS_mik serial
+   path, once via a row-band placement with `placement_workers=8` -- and asserts
+   (a) **byte-identical** banks (`torch.equal` per bank, full `[E, 2I, rb(H)]` /
+   `[E, H, rb(I)]`), (b) **identical `tracker.note` order** (capture the fired
+   layer sequence from the sink and compare to the serial sequence), (c)
+   `(seen_gu, seen_dn)` completeness. Runs on CPU; no GPU/ROCm needed, so it is
+   CI-green in seconds.
+2. Only if (a)+(b) pass: add `placement_workers=8` to the O_DIRECT parallel
+   loader and re-measure cold build on the 7900 XTX. Land the code with the test;
+   keep the serial path default so nothing else changes.
+3. Record tok/s + build seconds and the memcpy farm-out factor in
+   `BENCHMARK_RESULTS.md` UPDATE 3 and update this plan's verdict.
+
+### 9.5 Gate for any wider reordering (do not skip)
+
+Before whole-tensor pooling / out-of-stream-order `note` is ever considered,
+extend 9.4's test (b) to fire `tracker.note` in a deliberately shuffled order for
+real `LayerCompletionTracker` + `PinPipeline` and assert the sink still fires
+once per completed layer in ascending layer order. If the tracker's "arbitrary
+order" claim holds up under test, that path reopens; until then, placement stays
+row-band-within-tensor and the note sequence is byte-identical to serial.
+
+---
+
+(Back to the rank-ordered list for the decode gap proper -- §1-8 unchanged; this §9
+is closed as a *plan* pending 9.4's measurement, per the harness rule that
+hypotheses ship as plans, not as code without a passing test.)
